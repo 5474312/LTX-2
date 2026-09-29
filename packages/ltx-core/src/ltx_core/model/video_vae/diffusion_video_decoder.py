@@ -1563,6 +1563,7 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         generator: torch.Generator | None = None,
         *,
         keyframes: DecodeKeyframes | None = None,
+        **_kwargs: object,
     ) -> Iterator[torch.Tensor]:
         """Decode latent video, yielding float chunk(s) ``[f, h, w, c]`` in ``[0, 1]``.
         Untiled and tiled both go through ``_decode_pixels``. Tiled decode may yield

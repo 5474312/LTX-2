@@ -9,6 +9,7 @@ from tqdm import tqdm
 from ltx_core.components.diffusion_steps import (
     EulerAncestralDiffusionStep,
     EulerCfgPpDiffusionStep,
+    EulerDiffusionStep,
     Res2sDiffusionStep,
 )
 from ltx_core.components.protocols import DiffusionStepProtocol
@@ -17,7 +18,7 @@ from ltx_core.model.transformer import X0Model
 from ltx_core.utils import to_denoised, to_velocity
 from ltx_pipelines.utils.helpers import post_process_latent, timesteps_from_mask
 from ltx_pipelines.utils.res2s import get_res2s_coefficients
-from ltx_pipelines.utils.types import DenoisedLatentResult, Denoiser, LatentState
+from ltx_pipelines.utils.types import DenoisedLatentResult, Denoiser, LatentState, VideoAudio
 
 logger = logging.getLogger(__name__)
 
@@ -40,14 +41,14 @@ def euler_denoising_loop(
     sigmas: torch.Tensor,
     video_state: LatentState | None,
     audio_state: LatentState | None,
-    stepper: DiffusionStepProtocol,
     transformer: X0Model,
     denoiser: Denoiser,
-) -> tuple[LatentState | None, LatentState | None]:
+) -> VideoAudio[LatentState]:
     """
     Perform the joint audio-video denoising loop over a diffusion schedule.
     Either ``video_state`` or ``audio_state`` may be ``None`` for absent
-    modalities; the absent modality is passed through unchanged.
+    modalities; the absent modality is passed through unchanged. Each step is
+    an :class:`~ltx_core.components.diffusion_steps.EulerDiffusionStep`.
     ### Parameters
     sigmas:
         A 1D tensor of noise levels (diffusion sigmas) defining the sampling
@@ -56,20 +57,18 @@ def euler_denoising_loop(
         The current video :class:`LatentState`, or ``None`` if video is absent.
     audio_state:
         The current audio :class:`LatentState`, or ``None`` if audio is absent.
-    stepper:
-        An implementation of :class:`DiffusionStepProtocol` that updates a
-        latent given the current latent, its denoised estimate, the full
-        ``sigmas`` schedule, and the current step index.
     transformer:
         The diffusion model passed to the denoiser at each step.
     denoiser:
         A callable implementing :class:`Denoiser`. It is invoked as
         ``denoiser(transformer, video_state, audio_state, sigmas, step_index)``
-        and must return a :class:`~ltx_pipelines.utils.types.DenoisedLatentResult`.
+        and must return a :class:`~ltx_pipelines.utils.types.VideoAudio` of
+        :class:`~ltx_pipelines.utils.types.DenoisedLatentResult`.
     ### Returns
-    tuple[LatentState | None, LatentState | None]
-        Final ``(video_state, audio_state)`` after the denoising loop.
+    VideoAudio[LatentState]
+        Final video and audio :class:`LatentState` after the denoising loop.
     """
+    stepper = EulerDiffusionStep()
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
         video_result, audio_result = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
         denoised_video = video_result.denoised if video_result is not None else None
@@ -78,18 +77,17 @@ def euler_denoising_loop(
         video_state = _step_state(video_state, denoised_video, stepper, sigmas, step_idx)
         audio_state = _step_state(audio_state, denoised_audio, stepper, sigmas, step_idx)
 
-    return (video_state, audio_state)
+    return VideoAudio(video_state, audio_state)
 
 
 def gradient_estimating_euler_denoising_loop(
     sigmas: torch.Tensor,
     video_state: LatentState | None,
     audio_state: LatentState | None,
-    stepper: DiffusionStepProtocol,
     transformer: X0Model,
     denoiser: Denoiser,
     ge_gamma: float = 2.0,
-) -> tuple[LatentState | None, LatentState | None]:
+) -> VideoAudio[LatentState]:
     """
     Perform the joint audio-video denoising loop using gradient-estimation sampling.
     Same interface as :func:`euler_denoising_loop` with an additional
@@ -99,10 +97,11 @@ def gradient_estimating_euler_denoising_loop(
         Gradient estimation coefficient controlling the velocity correction term.
         Default is 2.0. Paper: https://openreview.net/pdf?id=o2ND9v0CeK
     ### Returns
-    tuple[LatentState | None, LatentState | None]
+    VideoAudio[LatentState]
         See :func:`euler_denoising_loop` for return value description.
     """
 
+    stepper = EulerDiffusionStep()
     previous_audio_velocity = None
     previous_video_velocity = None
 
@@ -131,7 +130,7 @@ def gradient_estimating_euler_denoising_loop(
                 video_state = replace(video_state, latent=denoised_video)
             if audio_state is not None and denoised_audio is not None:
                 audio_state = replace(audio_state, latent=denoised_audio)
-            return video_state, audio_state
+            return VideoAudio(video_state, audio_state)
 
         if video_state is not None and denoised_video is not None:
             previous_video_velocity, denoised_video = update_velocity_and_sample(
@@ -149,7 +148,7 @@ def gradient_estimating_euler_denoising_loop(
                 audio_state, latent=stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx)
             )
 
-    return (video_state, audio_state)
+    return VideoAudio(video_state, audio_state)
 
 
 def _get_plain_noise(x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
@@ -209,7 +208,6 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     sigmas: torch.Tensor,
     video_state: LatentState | None,
     audio_state: LatentState | None,
-    stepper: DiffusionStepProtocol,
     transformer: X0Model,
     denoiser: Denoiser,
     noise_seed: int = -1,
@@ -220,14 +218,14 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     new_noise_fn: Callable[[torch.Tensor, torch.Generator], torch.Tensor] = _get_new_noise,
     model_dtype: torch.dtype = torch.bfloat16,
     legacy_mode: bool = True,
-) -> tuple[LatentState | None, LatentState | None]:
+) -> VideoAudio[LatentState]:
     """
     Joint audio-video denoising loop using the res_2s second-order sampler.
     Iterates over the diffusion schedule with a two-stage Runge-Kutta step:
     evaluates the denoiser at the current point and at a midpoint (with SDE
     noise), then combines both with RK coefficients. Supports anchor-point
-    refinement (bong iteration) and optional SDE noise injection. Requires
-    :class:`Res2sDiffusionStep` as ``stepper``.
+    refinement (bong iteration) and optional SDE noise injection. Each update
+    is a :class:`Res2sDiffusionStep`.
     Either modality may be ``None`` (absent).
     ### Parameters
     transformer:
@@ -250,9 +248,10 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     model_dtype:
         Dtype for latent state updates (e.g. bfloat16).
     ### Returns
-    tuple[LatentState | None, LatentState | None]
-        Final ``(video_state, audio_state)`` after the denoising loop.
+    VideoAudio[LatentState]
+        Final video and audio :class:`LatentState` after the denoising loop.
     """
+    stepper = Res2sDiffusionStep()
     # Determine device from whichever state is present
     present_state = video_state or audio_state
     if present_state is None:
@@ -272,9 +271,6 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     step_noise_injecting_fn = partial(sde_noise_injecting_fn, step_noise_generator=step_noise_generator, eta=eta)
     # substep eta is always default 0.5 for compatibility with original implementation.
     substep_noise_injecting_fn = partial(sde_noise_injecting_fn, step_noise_generator=substep_noise_generator, eta=0.5)
-
-    if not isinstance(stepper, Res2sDiffusionStep):
-        raise ValueError("stepper must be an instance of Res2sDiffusionStep")
 
     n_full_steps = len(sigmas) - 1
     # inject minimal sigma value to avoid division by zero
@@ -444,7 +440,7 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
             denoised_audio_1 = post_process_latent(denoised_audio_1, audio_state.denoise_mask, audio_state.clean_latent)
             audio_state = replace(audio_state, latent=denoised_audio_1.to(model_dtype))
 
-    return video_state, audio_state
+    return VideoAudio(video_state, audio_state)
 
 
 @dataclass(frozen=True)
@@ -496,7 +492,7 @@ def _ancestral_euler_denoising_loop(
     model_dtype: torch.dtype,
     draw_noise: bool,
     make_step_fn: Callable[[DenoisedLatentResult | None, str], Callable[..., torch.Tensor]],
-) -> tuple[LatentState | None, LatentState | None]:
+) -> VideoAudio[LatentState]:
     """
     Shared driver for the ancestral (noise-injecting) Euler denoising loops.
     Steps each present modality in float32, re-applies the conditioning mask
@@ -517,7 +513,7 @@ def _ancestral_euler_denoising_loop(
         returns (before the terminal-sigma check), so it can also validate the
         denoiser output. ``modality`` is ``"video"`` or ``"audio"``.
     ### Returns
-    tuple[LatentState | None, LatentState | None]
+    VideoAudio[LatentState]
         Final ``(video_state, audio_state)`` after the denoising loop.
     """
     if video_state is None and audio_state is None:
@@ -560,28 +556,28 @@ def _ancestral_euler_denoising_loop(
         if terminal_step:
             break
 
-    return states["video"], states["audio"]
+    return VideoAudio(states["video"], states["audio"])
 
 
 def euler_ancestral_denoising_loop(
     sigmas: torch.Tensor,
     video_state: LatentState | None,
     audio_state: LatentState | None,
-    stepper: EulerAncestralDiffusionStep,
     transformer: X0Model,
     denoiser: Denoiser,
     noise_seed: int = -1,
     new_noise_fn: Callable[[torch.Tensor, torch.Generator], torch.Tensor] = _get_plain_noise,
     model_dtype: torch.dtype = torch.bfloat16,
-) -> tuple[LatentState | None, LatentState | None]:
+    eta: float = 1.0,
+    s_noise: float = 1.0,
+) -> VideoAudio[LatentState]:
     """
     Joint audio-video denoising loop using the ancestral (SDE) Euler sampler.
     Each step takes a deterministic Euler step to an intermediate ``sigma_down``
     and renoises back up to the next sigma; see
     :class:`~ltx_core.components.diffusion_steps.EulerAncestralDiffusionStep`.
     Works with any denoiser (no ``uncond`` prediction required). With
-    ``stepper=EulerAncestralDiffusionStep(eta=0.0)`` this reduces to
-    :func:`euler_denoising_loop`.
+    ``eta=0.0`` this reduces to :func:`euler_denoising_loop`.
     Either ``video_state`` or ``audio_state`` may be ``None`` for absent
     modalities. When both are present, noise is drawn from the same seeded
     generator (video first, audio second).
@@ -592,9 +588,6 @@ def euler_ancestral_denoising_loop(
         Current video :class:`~ltx_core.types.LatentState`, or ``None``.
     audio_state:
         Current audio :class:`~ltx_core.types.LatentState`, or ``None``.
-    stepper:
-        :class:`~ltx_core.components.diffusion_steps.EulerAncestralDiffusionStep`
-        instance carrying ``eta`` and ``s_noise`` parameters.
     transformer:
         The diffusion model passed to the denoiser at each step.
     denoiser:
@@ -608,13 +601,18 @@ def euler_ancestral_denoising_loop(
     model_dtype:
         Dtype for latent state updates. Default ``bfloat16``. Pass
         ``torch.float32`` to keep the sampling trajectory in full precision.
+    eta:
+        Stochastic noise injection strength passed to each
+        :meth:`~ltx_core.components.diffusion_steps.EulerAncestralDiffusionStep.step`.
+        ``0`` is a plain Euler step; ``1`` is fully ancestral. Default ``1.0``.
+    s_noise:
+        Scale on the injected noise. Default ``1.0``. At ``0`` the step still
+        applies its variance-preserving rescale.
     ### Returns
-    tuple[LatentState | None, LatentState | None]
+    VideoAudio[LatentState]
         Final ``(video_state, audio_state)`` after the denoising loop.
     """
-    if not isinstance(stepper, EulerAncestralDiffusionStep):
-        raise ValueError(f"stepper must be an instance of EulerAncestralDiffusionStep, got {type(stepper).__name__}")
-
+    stepper = EulerAncestralDiffusionStep()
     return _ancestral_euler_denoising_loop(
         sigmas=sigmas,
         video_state=video_state,
@@ -626,9 +624,8 @@ def euler_ancestral_denoising_loop(
         model_dtype=model_dtype,
         # Gated on eta alone: at s_noise=0 the step still applies its variance-preserving
         # rescale, so it must not fall back to the noise-free branch.
-        draw_noise=stepper.eta > 0,
-        # The ancestral step needs nothing beyond the standard arguments.
-        make_step_fn=lambda _result, _modality: stepper.step,
+        draw_noise=eta > 0,
+        make_step_fn=lambda _result, _modality: partial(stepper.step, eta=eta, s_noise=s_noise),
     )
 
 
@@ -636,13 +633,14 @@ def euler_cfg_pp_denoising_loop(
     sigmas: torch.Tensor,
     video_state: LatentState | None,
     audio_state: LatentState | None,
-    stepper: EulerCfgPpDiffusionStep,
     transformer: X0Model,
     denoiser: Denoiser,
     noise_seed: int = -1,
     new_noise_fn: Callable[[torch.Tensor, torch.Generator], torch.Tensor] = _get_plain_noise,
     model_dtype: torch.dtype = torch.bfloat16,
-) -> tuple[LatentState | None, LatentState | None]:
+    eta: float = 1.0,
+    s_noise: float = 1.0,
+) -> VideoAudio[LatentState]:
     """
     Joint audio-video denoising loop using the CFG++ corrected Euler sampler.
     Applies the CFG++ update rule at each step: the ODE derivative is computed
@@ -660,9 +658,6 @@ def euler_cfg_pp_denoising_loop(
         Current video :class:`~ltx_core.types.LatentState`, or ``None``.
     audio_state:
         Current audio :class:`~ltx_core.types.LatentState`, or ``None``.
-    stepper:
-        :class:`~ltx_core.components.diffusion_steps.EulerCfgPpDiffusionStep`
-        instance carrying ``eta`` and ``s_noise`` parameters.
     transformer:
         The diffusion model passed to the denoiser at each step.
     denoiser:
@@ -675,15 +670,20 @@ def euler_cfg_pp_denoising_loop(
         :func:`_get_new_noise` for the normalized variant used in res2s.
     model_dtype:
         Dtype for latent state updates. Default ``bfloat16``.
+    eta:
+        Stochastic noise injection strength passed to each
+        :meth:`~ltx_core.components.diffusion_steps.EulerCfgPpDiffusionStep.step`.
+        Default ``1.0``.
+    s_noise:
+        Scale on the injected noise. Default ``1.0``.
     ### Returns
-    tuple[LatentState | None, LatentState | None]
-        Final ``(video_state, audio_state)`` after the denoising loop.
+    VideoAudio[LatentState]
+        Final video and audio :class:`LatentState` after the denoising loop.
     """
-    if not isinstance(stepper, EulerCfgPpDiffusionStep):
-        raise ValueError(f"stepper must be an instance of EulerCfgPpDiffusionStep, got {type(stepper).__name__}")
+    stepper = EulerCfgPpDiffusionStep()
 
     def make_step_fn(result: DenoisedLatentResult | None, modality: str) -> Callable[..., torch.Tensor]:
-        """Bind the modality's uncond prediction into the CFG++ step."""
+        """Bind the modality's uncond prediction and the loop's noise scales into the CFG++ step."""
         uncond = result.uncond if result is not None else None
         if not isinstance(uncond, torch.Tensor):
             raise ValueError(
@@ -691,7 +691,7 @@ def euler_cfg_pp_denoising_loop(
                 "Use GuidedDenoiser or FactoryGuidedDenoiser with cfg_scale != 1 "
                 "or force_uncond_pass=True and a negative_context."
             )
-        return partial(stepper.step, uncond_denoised=uncond)
+        return partial(stepper.step, uncond_denoised=uncond, eta=eta, s_noise=s_noise)
 
     return _ancestral_euler_denoising_loop(
         sigmas=sigmas,
@@ -702,6 +702,6 @@ def euler_cfg_pp_denoising_loop(
         noise_seed=noise_seed,
         new_noise_fn=new_noise_fn,
         model_dtype=model_dtype,
-        draw_noise=stepper.eta > 0 and stepper.s_noise > 0,
+        draw_noise=eta > 0 and s_noise > 0,
         make_step_fn=make_step_fn,
     )

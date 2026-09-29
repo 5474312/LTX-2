@@ -13,7 +13,7 @@ Do you need HDR / EXR I/O?
 ├─ YES → Do you have EXR stills or EXR-frame folders for a standard pipeline?
 │  ├─ YES → Use Distilled / TI2V / Retake / IC-LoRA with `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}`
 │  │         (see [HDR Support](hdr.md); EXR + BT.2020/HLG output)
-│  └─ NO → Use HDRICLoraPipeline (video-to-video with HDR IC-LoRA / LogC3 decode)
+│  └─ NO → Use HDRICLoraPipeline (SDR video → ACEScct HDR; HLG master + EXR)
 │
 Do you need to condition on existing images/videos?
 ├─ YES → Do you have reference videos for video-to-video?
@@ -50,7 +50,7 @@ Do you need to condition on existing images/videos?
 | [**KeyframeInterpolationPipeline**](pipelines.md#6-keyframeinterpolationpipeline) | 2 | ✅ | ✅ | Keyframes | Animation, interpolation |
 | [**A2VidPipelineTwoStage**](pipelines.md#7-a2vidpipelinetwostage) | 2 | ✅ | ✅ | Audio + Image | Audio-driven video generation |
 | [**RetakePipeline**](pipelines.md#8-retakepipeline) | 1 | ✅ | ❌ | Source Video | Regenerating a time region of a video |
-| [**HDRICLoraPipeline**](pipelines.md#9-hdriclorapipeline) | 2 | ❌ | ✅ | Video | HDR IC-LoRA video-to-video (linear float / EXR); see also native [`--hdr`](hdr.md) |
+| [**HDRICLoraPipeline**](pipelines.md#9-hdriclorapipeline) | 1 | ❌ | ❌ | Video | SDR-to-HDR with an HDR IC-LoRA (HLG master + EXR via `--exr-colorspace`); see also native [`--hdr`](hdr.md) |
 | [**DubItPipeline**](pipelines.md#10-dubitpipeline) | 2 | ✅ | ✅ | Video + Audio | Dub-It with audio ref conditioning |
 | [**T2AOneStagePipeline**](pipelines.md#11-t2aonestagepipeline) | 1 | Audio only | ❌ | None (text) | Text-to-audio (audio-only output, no video) |
 

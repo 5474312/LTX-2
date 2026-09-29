@@ -7,13 +7,7 @@ from typing import Protocol
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from ltx_core.model.transformer.ops import (
-    GatedAttentionCallable,
-    PreAttentionCallable,
-    PytorchGatedAttention,
-    PytorchPreAttention,
-)
-from ltx_core.model.transformer.rope import LTXRopeType
+from ltx_core.model.transformer.rope import LTXRopeType, apply_rotary_emb
 
 
 def _torch_default_sdpa_priority() -> list[SDPBackend]:
@@ -471,8 +465,6 @@ class AttentionOps:
     masked_attention_function: MaskedAttentionCallable = field(
         default_factory=lambda: MaskedAttentionFunction.AUTOMATIC.to_callable()
     )
-    preattention_function: PreAttentionCallable = field(default_factory=PytorchPreAttention)
-    gated_attention_function: GatedAttentionCallable = field(default_factory=PytorchGatedAttention)
 
 
 class Attention(torch.nn.Module):
@@ -493,8 +485,6 @@ class Attention(torch.nn.Module):
         self.rope_type = rope_type
         self.attention_function = ops.attention_function
         self.masked_attention_function = ops.masked_attention_function
-        self.preattention_function = ops.preattention_function
-        self.gated_attention_function = ops.gated_attention_function
 
         inner_dim = dim_head * heads
         context_dim = query_dim if context_dim is None else context_dim
@@ -563,7 +553,11 @@ class Attention(torch.nn.Module):
         else:
             q = self.to_q(x)
             k = self.to_k(context)
-            q, k = self.preattention_function(q, k, self, mask, pe, k_pe)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            if pe is not None:
+                q = apply_rotary_emb(q, pe, self.rope_type)
+                k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
             if mask is None:
                 out = self.attention_function(q, k, v, self.heads)  # (B, T, H*D)
             else:
@@ -574,6 +568,11 @@ class Attention(torch.nn.Module):
 
         # Apply per-head gating if enabled
         if self.to_gate_logits is not None:
-            out = self.gated_attention_function(x, out, self)
+            gate_logits = self.to_gate_logits(x)
+            b, t, _ = out.shape
+            out = out.view(b, t, self.heads, self.dim_head)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out * gates.unsqueeze(-1)
+            out = out.view(b, t, self.heads * self.dim_head)
 
         return self.to_out(out)

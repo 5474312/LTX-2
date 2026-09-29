@@ -52,9 +52,11 @@ and invents new ones per tile during temporal rounds.
 
 **Usage.** Pass `generated_keyframes` to `__call__`: an `int` requests that many evenly spaced
 interior keyframes (both endpoints excluded), a sequence gives explicit frame indices. On the CLI the
-flag is `--num-generated-keyframes N` (default `0`, off). It is opt-in per pipeline rather than a
-shared flag, so only the CLIs listed above advertise it — `DFRPipeline` derives its own slot
-positions and does not accept it.
+flag is `--num-generated-keyframes N` (default `0`, off). Pass `decode_with_keyframes=True` (CLI:
+`--decode-with-keyframes`) to decode through the keyframe-aware DiffVAE path using those slots as
+anchors. It is opt-in per pipeline rather than a shared flag, so only the CLIs listed above
+advertise both flags -- `DFRPipeline` derives its own slot positions, always keyframe-decodes, and
+does not accept either flag.
 
 **Reading the keyframes back.** Generated keyframes land in `LatentState.generated_keyframes` with
 shape `(B, C, K, H, W)`. Decode each one as a standalone single-frame clip: a K-frame causal decode

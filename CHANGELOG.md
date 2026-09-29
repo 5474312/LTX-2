@@ -1,5 +1,67 @@
 # Changelog
 
+## 1.4.0 - 2026-09-29
+
+### Added
+
+- `--chunked` on Distilled, TI2Vid two-stage, A2Vid, Dub-It, and IC-LoRA enables long-video generation with the default chunk layout (97-frame windows and 25-frame carry) without setting `--chunk-pixel-frames` or `--chunk-carry-frames`; `--chunk-blend-frames` controls decoded video seam crossfade length.
+- `ltx-kernels` production `sm_100a` wheels now load precompiled LTX-2.5 diffusion-VAE CuTe DSL kernels, eliminating first-decode JIT for standard plain and keyframe decoding; custom kernel shapes still compile on first use.
+- `ICLoraPipeline` accepts `stages`, a sequence of `ICLoraStageConfig` (resolution, IC-LoRA, sigmas, optional transformer tiling). Default remains half-res with IC-LoRA, then a full-res refinement without it. Consecutive stages must stay at the same resolution or upsample by exactly 2x.
+- `spatial_tiled_ic_lora_stages()` builds that two-stage recipe with fixed-size spatial tiling so large canvases stay on a trained window; both stages keep the IC-LoRA and reference.
+- `TiledDiffusionModel` and `FixedSizeSpatialTiling` in `ltx_pipelines.utils.tiled_diffusion` run sequential transformer tiles with trapezoidal blending. DFR's spatial epilogue uses the same wrapper.
+- `--stage-2-ic-lora` on `ltx_pipelines.ic_lora` keeps the IC-LoRA and reference on stage 2. `--tile` enables transformer tiling (default window 1024x1536; override with `--tile-height` / `--tile-width`). The CLI is always the two-stage recipe; omit `--tile` at 1080-class sizes to keep today's untiled path. A GPU OOM from that CLI is re-raised with `--tile` / `--tile-height` / `--tile-width` and `--offload cpu`.
+- `decode_with_keyframes` on `TI2VidOneStagePipeline`, `TI2VidTwoStagesPipeline`, `TI2VidTwoStagesHQPipeline`, and `DistilledPipeline`, plus the `distilled_mgpu`, `ti2vid_two_stages_mgpu`, and `ti2vid_two_stages_hq_mgpu` runners (CLI: `--decode-with-keyframes`). When set together with generated keyframe slots, the pipeline decodes through the keyframe-aware DiffVAE path using those slots as anchors. Two-stage pipelines re-attach seeded slots at stage 2 so the planes sit at final resolution before decode.
+- `AudioConditionByLatentIndex` pins an audio latent at a given latent index, matching `VideoConditionByLatentIndex` for video.
+- Added `ltx_pipelines.chunks`, a building block for long-video generation: plan a clip as temporal windows, run denoise → upsample → decode one window at a time, and stitch continuity across seams so VRAM stays bounded by window size rather than full clip length.
+- Distilled, TI2Vid two-stage, A2Vid, Dub-It, and IC-LoRA can generate long clips in overlapping windows instead of holding the full timeline in memory. Pass `--chunk-pixel-frames` and optionally `--chunk-carry-frames` on the CLI (or `chunk_config` / `stream_chunks()` in Python) to tune window size and overlap; omit both flags for the existing one-shot path.
+- Chunked long-video generation plans generated keyframes per window: an integer is a per-chunk slot budget with automatic stitch anchors; an explicit index list is merged with those anchors. Reference conditioning on continuation chunks appends only the suffix after the carried overlap while still encoding the full window for causal VAE alignment.
+- DFR diffusion work is importable from `ltx_pipelines.dfr_stages` (`denoise_stage1`, `denoise_stage2`, `run_one_temporal_round`, `run_spatial_epilogue`) and helpers from `ltx_pipelines.dfr_helpers`, so an adapter can run the same path from a constructed `DiffusionStage` without wrapping `DFRPipeline` or instantiating Gemma.
+- `--exr-colorspace` on `ltx_pipelines.hdr_ic_lora` (`acescg` / `acescct` / `srgb_linear`; default `acescg`). Only the EXR sidecar encoding changes; the HLG master stays BT.2020/HLG.
+- `--transformer-path` on `ltx_pipelines.hdr_ic_lora`, which runs the pipeline from a split checkpoint pack instead of a distilled monolith. A split transformer carries no VAE weights, so `--video-vae-path` has to accompany it.
+- `EXRColorSpace` / `VideoInput` in `ltx_pipelines` and an sRGB EOTF in `ltx_core.hdr`, which convert an SDR source into ACEScct.
+
+### Changed
+
+- The `ltx_kernels_inductor` compile backend batches the fp8-cast policy's per-forward weight and bias upcasts into a few grouped kernels instead of one per tensor. Outputs are bit-identical.
+- Chunk planning owns generated-keyframe placement and appends slots after pipeline conditionings. Generated slots remain transformer conditioning across every stage; `decode_with_keyframes` now controls only whether the final slots anchor video decode.
+- `ChunkConfig.overlap_blend_frames` defaults to the full carry overlap (crossfade over all carried frames). Pass `0` for a hard cut at chunk seams.
+- `ChunkConfig.overlap_blend_frames` linearly crossfades a configurable suffix of each decoded overlap instead of cutting directly between windows, buffering only that suffix during streaming.
+- DFR spatial epilogues run their first denoising step on a 2x2 tile grid before retiling any remaining steps to 4x4. A one-step schedule stays on the 2x2 grid.
+- `create_initial_audio_latent` now takes a video latent and required `video_scale_factors`. Joint first stages use `create_initial_av_latents`, which also requires `video_scale_factors`. `create_initial_video_latent` requires `scale_factors` (no default). Pass the same video VAE factors used to size the video latent. Audio-only callers use `AudioLatentShape.from_duration`.
+- Distilled and DFR sample with Euler ancestral (`eta=1.0`, `s_noise=1.0`) on LTX-2.5+ checkpoints -- distilled on both stages, DFR on stage 1, stage 2 and the spatial epilogue -- so generated output for those checkpoints differs from the previous release. Older generations sample with deterministic Euler. DFR's temporal densify tiles are unchanged at `eta=0.5`.
+- `PipelineOutput` is again a four-field named tuple (`video`, `audio`, `num_frames`, `tiling_config`). Pipelines choose keyframe-aware decode internally; the returned `video` iterator reflects that choice.
+- Conv, diffusion, and distributed `decode_video()` accept extra keyword arguments and ignore ones they do not use.
+- Denoisers, denoising loops and `DiffusionStage.__call__` return `VideoAudio` instead of a plain `(video, audio)` tuple. It still unpacks as two values, and also exposes `.video` and `.audio`. Omit the absent side (`VideoAudio(video=...)`); constructing with both `None` raises.
+- `DiffusionStage.__call__` is now a latent entry point. Pass `modalities=VideoAudio[ModalitySpec]` (either side may be omitted, but not both). Each `ModalitySpec` carries the latent to denoise, and that latent is the stage's only source of shape, so the stage never sizes a latent itself. Seed a pipeline's first stage with `create_initial_video_latent` / `create_initial_audio_latent` / `create_initial_av_latents` in `ltx_pipelines.utils.helpers`, and hand every later stage the previous stage's output, upscaled or not. Audio-only callers no longer need to pass placeholder video dimensions.
+- `encode_video` and `encode_sdr_h264` accept streaming video frame iterators and can mux audio supplied as it becomes available, so long chunked runs can write a file without assembling the full clip first.
+- One-shot `__call__` on Distilled, TI2Vid, A2Vid, and Dub-It still returns `PipelineOutput`; internally it uses the same chunked path with a single window. Reported `num_frames` is the stitched length on the causal grid.
+- `ltx_pipelines.hdr_ic_lora` is a single-stage ACEScct SDR-to-HDR pipeline. It writes a 10-bit BT.2020/HLG master plus an EXR sequence whose colour space is `--exr-colorspace` (default ACEScg; `acescct` writes VAE log codes), where it previously ran two stages and returned linear float from a LogC3 inverse decode for the caller to tonemap and save. `--input-colorspace` selects the input transform, so the source may be an SDR MP4/MOV (`srgb_gamma`, `srgb`) or a directory of EXR frames (`srgb`, `acescg`, `acescct`); EXR directories also need `--frame-rate`, which a container source must not set.
+- HDR EXR output directories are named for their colour space: `<output_stem>_acescct_exr`, `<output_stem>_acescg_exr` or `<output_stem>_srgb_linear_exr`. Every HDR run previously wrote `<output_stem>_exr`, so code that globs the old path will not find the frames.
+- `--distilled-checkpoint-path` on `ltx_pipelines.hdr_ic_lora` is no longer required, since `--transformer-path` can supply the transformer instead. One of the two is still needed.
+- DFR seam keyframes on `ltx_pipelines.hdr_ic_lora` are on by default. `--with-keyframes` is replaced by `--no-keyframes`. A 2.4 transformer fails the capability check unless `--no-keyframes` is passed; a 2.5 distilled monolith still needs `--video-vae-path` to a keyframe-trained VAE or the keyframe path is a silent no-op.
+- `ltx-core` requires `colour-science`, which supplies the primaries, YUV matrix and HLG transfer definitions that were previously hand-written constants.
+
+### Removed
+
+- `stepper` on `DiffusionStage.__call__`, `denoise_chunks`, the DFR stage functions, and the denoising loops. Each loop constructs its own step. Pass `eta` and `s_noise` to `euler_ancestral_denoising_loop` and `euler_cfg_pp_denoising_loop`. `EulerAncestralDiffusionStep` and `EulerCfgPpDiffusionStep` no longer take those arguments; pass them to `step`.
+- `TiledModelWrapper` in `ltx_pipelines.dfr_helpers.ops`; use `TiledDiffusionModel` from `ltx_pipelines.utils.tiled_diffusion`.
+- `QuantizationPolicy.model_configurator`; pass the configurator directly to the model builder or `DiffusionStage.from_checkpoint(model_configurator=...)`.
+- `All2All.set_rank_tokens`; All2All head exchange and AllGather now derive uniform token counts from their input tensors.
+- `PipelineOutput.keyframes` and `PipelineOutput.video_latent`; use `decode_with_keyframes=True` (CLI: `--decode-with-keyframes`) on pipelines that support it.
+- `width`, `height`, `frames` and `audio_fps` on `DiffusionStage.__call__`; size the latent yourself and pass it as `ModalitySpec(latent=...)`. Audio sized off a playback rate that differs from the video RoPE time base, which `audio_fps` covered in 1.3.0, is now done by building the audio latent at that rate with `create_initial_audio_latent(..., fps=...)`.
+- Separate `video` and `audio` kwargs on `DiffusionStage.__call__`; pass `modalities=VideoAudio(...)`.
+- `ModalitySpec.initial_latent`; use `ModalitySpec.latent`, which is required.
+- `ImageConditioningInput` from `ltx_pipelines.utils.args`; import it from `ltx_pipelines.utils.types`.
+- `--output-dir` on `ltx_pipelines.hdr_ic_lora`; use `--output-path`, which names the HLG master and places the EXR directory beside it.
+- `--spatial-upsampler-path`, `--num-frames`, `--spatial-tile` and `--skip-mp4` on `ltx_pipelines.hdr_ic_lora`. The pipeline is single-stage and does not upsample, output length follows the source clip (whose frame count must be 8k+1), decode tiling is resolved automatically, and the HLG master is always written beside the EXR frames.
+
+### Fixed
+
+- Generated audio could outlast the decoded video when `num_frames` was not on the video VAE temporal grid (for example 87 frames at 24 fps decoded 81 picture frames against a longer soundtrack). Initial audio latents are now sized from the snapped video canvas.
+- Chunked vocoded audio retains a 40 ms overlap and equal-power crossfades it at generation-window seams, avoiding clicks while keeping the causal decoder shortfall at stream startup.
+- Multi-GPU sequence-parallel runs compiled with `torch.compile` could produce a corrupted, repeating texture instead of the prompted scene (seen with the `ltx_kernels_inductor` backend). The compiler could keep its own tensors in the All2All exchange buffer, which the next exchange overwrote. `torch.ops.ltx_kernels.send_recv_heads` and `gather_heads` now take that buffer as an argument they write in place and return nothing; `All2All.send_recv_heads` and `All2All.gather_heads` are unchanged.
+- Pinned equal-size transformer windows reject an overlap above half the window and round the tile count down, so three tiles never cover one cell. This is the layout used by IC-LoRA `--tile`. The requested overlap is a target and the realized overlap may be smaller. Two tiles on a canvas only slightly larger than the window can still overlap by more than half, because there is no third tile.
+
 ## 1.3.0 - 2026-08-25
 
 ### Added
@@ -23,6 +85,11 @@
 - Video pipelines now return a named `PipelineOutput` instead of a 3- or 4-tuple. Extra fields are `keyframes` and `video_latent`. Existing unpacking must switch to `result.video`, `result.audio`, and so on.
 - `VideoDecoder.decode_video()` takes `keyframes=` on every implementation. The diffusion decoder uses them; conv logs a warning and decodes without them; distributed splits them across ranks. Callers that never pass keyframes are unaffected; decoder implementations must accept the keyword.
 - NVFP4 quantization and CuTe DSL DiffVAE kernels (`blackwell_dsl`) now support Jetson Thor. Build NVFP4 with the arch-specific `110a` target.
+
+- The DFR spatial epilogue now generates the keyframes it ships instead of shipping upscales. The planes it carries in are Lanczos x2 stretches of the previous stage, so anchoring the VAE decode on them blurred the very frames a keyframe is meant to sharpen; they are now conditioning only, and the epilogue attaches a slot a latent frame to the side of each (a slot cannot occupy the frame the plane holds) and ships those full-resolution results. `PipelineOutput.keyframes.pixel_frame_indices` therefore move 8 frames from the carried positions. A candidate that would land inside a temporal window's pinned prefix is skipped, so a few carried positions ship no plane at all.
+- A DFR temporal tile (and epilogue window) begins on a **keyframe plane** rather than on a mid-canvas latent cell. A tile is denoised as its own clip, whose first cell the model reads as a single pixel frame under the causal convention, so starting it on an 8-frame cell put content and shape in disagreement and ran RoPE time 7 frames ahead of the canvas. Cell 0 is now the plane at the last keyframe before the seam, the cells between it and the seam are pinned to the previous tile's output, and the tile resumes after the seam -- the last pinned cell ends exactly on it, so the seam keyframe is absorbed and needs no conditioning of its own. The prefix length follows the keyframe grid rather than a configured overlap, so the tile split takes no overlap at all and kept runs are disjoint.
+- DFR temporal tiles and the spatial epilogue now hand over through a **pinned prefix** instead of synchronising on a shared keyframe. A non-first tile's lead-in cells are conditioned on the previous tile's finished output at strength 1, so they are that output at every step rather than a re-denoised approximation of it. Keyframe conditionings inside a pinned prefix are dropped, because the pinned cells hold the current stage's content while the plane holds an earlier stage's. Anchors from the resume point onward are unchanged, so the tile that owns a stretch still generates it against its keyframes.
+- The DFR spatial epilogue runs one denoising pass per temporal window, sequentially, instead of one pass over the whole canvas with every temporal tile re-run inside each Euler step. Spatial tiling and its per-step blending are unchanged. Temporal windows were already seam-cut, rectangular and never blended into each other, so this costs the same and is what gives each window a finished predecessor to pin its lead-in to.
 
 ### Removed
 

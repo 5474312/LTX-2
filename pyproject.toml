@@ -48,10 +48,9 @@ kernels = ["ltx-kernels"]
 target-version = "py311"
 line-length = 120
 exclude = [
-    # Vendored kernel sources, excluded from our lint/format rules.
-    "packages/ltx-kernels/src/ltx_kernels/blockwise/functional.py",
+    # Vendored kernel sources / hardware glue, excluded from our lint/format rules.
     "packages/ltx-kernels/src/ltx_kernels/blockwise/linear.py",
-    "packages/ltx-kernels/src/ltx_kernels/blockwise/triton_ops.py",
+    "packages/ltx-kernels/src/ltx_kernels/blockwise/ops/gemm.py",
 ]
 
 [tool.ruff.lint]
@@ -98,7 +97,7 @@ ignore = [
 # Tests for the CuTe DSL kernels. ltx-kernels is an optional, CUDA-host-only install,
 # so importing it at module level would turn "skipped" into a collection error wherever
 # it is absent -- which is most of CI.
-"packages/ltx-kernels/tests/test_vae_*.py" = ["PLC0415"]
+"packages/ltx-kernels/tests/ltx_kernels/test_vae_*.py" = ["PLC0415"]
 "packages/ltx-core/tests/**/test_dsl_kernels.py" = ["PLC0415"]
 # NVFP4 tests ``importorskip("ltx_kernels")`` before importing convert/linear/fuse
 # (which import the extension at module top level).

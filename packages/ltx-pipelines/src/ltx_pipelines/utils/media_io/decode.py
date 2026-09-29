@@ -14,10 +14,12 @@ import torch
 from PIL import ExifTags, Image, ImageCms, UnidentifiedImageError
 from torch._prims_common import DeviceLikeType
 
-from ltx_core.hdr import HDRTransfer
 from ltx_core.types import Audio, VideoPixelShape
-from ltx_pipelines.utils.media_io.color_config import HDRColorSpace
-from ltx_pipelines.utils.media_io.exr import is_exr_dir, load_exr_image_conditioning_hdr
+from ltx_pipelines.utils.media_io.color_config import EXRColorSpace, srgb_to_acescct
+from ltx_pipelines.utils.media_io.exr import (
+    is_exr_dir,
+    load_exr_image_as_hdr_conditioning,
+)
 from ltx_pipelines.utils.media_io.range_map import normalize_images, to_vae_range
 from ltx_pipelines.utils.media_io.resize import (
     ResizeMode,
@@ -50,7 +52,7 @@ def load_image_and_preprocess(
     dtype: torch.dtype,
     device: torch.device,
     crf: int,
-    color_space: HDRColorSpace | None = None,
+    color_space: EXRColorSpace | None = None,
 ) -> torch.Tensor:
     """
     Loads an image from a path and preprocesses it for conditioning.
@@ -63,7 +65,7 @@ def load_image_and_preprocess(
             raise ValueError(
                 "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space."
             )
-        return load_exr_image_conditioning_hdr(
+        return load_exr_image_as_hdr_conditioning(
             exr_path=image_path,
             height=height,
             width=width,
@@ -96,44 +98,40 @@ def video_preprocess(
     Returns:
         Tensor of shape (1, C, F, height, width) with values in [-1, 1].
     """
-    result: torch.Tensor | None = None
+    # Collect frames and concatenate once: per-frame cat reserves O(F^2) CUDA
+    # cache blocks when expandable segments are unavailable.
+    processed: list[torch.Tensor] = []
     for f in frames:
         frame = resize_and_center_crop(f.to(torch.float32), height, width)
-        frame = normalize_images(frame, device, dtype)
-        result = frame if result is None else torch.cat([result, frame], dim=2)
-    if result is None:
+        processed.append(normalize_images(frame, device, dtype))
+    if not processed:
         raise ValueError("video_preprocess received an empty frame generator; no frames were decoded from the source.")
-    return result
+    return torch.cat(processed, dim=2)
 
 
-def load_video_conditioning_hdr(
-    video_path: str,
+def load_video_as_hdr_conditioning(
+    video_path: str | Path,
     height: int,
     width: int,
     frame_cap: int,
     dtype: torch.dtype,
     device: torch.device,
-    transfer: HDRTransfer = HDRTransfer.LOGC3,
+    *,
+    gamma_encoded: bool = False,
+    frame_start: int = 0,
     resize_mode: ResizeMode = ResizeMode.CENTER_CROP,
 ) -> Iterator[torch.Tensor]:
-    """Load a video and yield preprocessed frames for HDR IC-LoRA conditioning.
-    Decodes through the standard path and applies the LDR compression that
-    matches training. Callers are responsible for providing Rec.709 SDR
-    input — the HDR IC-LoRA was trained on that color space.
-    Args:
-        transfer: Working-space transfer; ``compress_ldr`` is identity clamp for
-            all cases (SDR display-range input).
-        resize_mode: How to fit the video to the target resolution.
-    Yields:
-        Per-frame tensors of shape ``(1, C, 1, height, width)``.
-    """
+    """Load an MP4/MOV and yield ACEScct VAE-range frames ``(1, C, 1, height, width)``."""
     resize_fn = resize_and_reflect_pad if resize_mode is ResizeMode.REFLECT_PAD else resize_and_center_crop
-
-    for f in decode_video_by_frame(path=video_path, frame_cap=frame_cap, device=device):
-        frame = resize_fn(f.to(torch.float32), height, width)
-        ldr = (frame / 255.0).clamp(0.0, 1.0)
-        compressed = transfer.compress_ldr(ldr)
-        yield to_vae_range(compressed).to(device=device, dtype=dtype)
+    for f in decode_video_by_frame(
+        path=str(video_path), frame_cap=frame_cap, device=device, starting_frame=frame_start
+    ):
+        ldr = (f[0].float() / 255.0).clamp(0.0, 1.0)
+        native = ldr.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+        working = srgb_to_acescct(native, gamma_encoded=gamma_encoded)
+        working_hwc = working[0, :, 0].permute(1, 2, 0).contiguous()
+        frame = resize_fn(working_hwc, height, width)
+        yield to_vae_range(frame).to(device=device, dtype=dtype)
 
 
 def decode_image(image_path: str) -> np.ndarray:
@@ -169,7 +167,7 @@ def decode_image(image_path: str) -> np.ndarray:
                 image = image.convert("RGB")
 
             return np.array(image, dtype=np.uint8)
-    except UnidentifiedImageError as err:
+    except (UnidentifiedImageError, OSError) as err:
         raise ValueError(f"Cannot decode image file '{image_path}'.") from err
 
 

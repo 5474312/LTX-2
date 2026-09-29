@@ -18,11 +18,9 @@ import torch
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.batch_split import BatchSplitAdapter
 from ltx_core.block_streaming import DISK_CPU_SLOTS, StreamingModelBuilder
-from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.noisers import Noiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
-from ltx_core.components.protocols import DiffusionStepProtocol
-from ltx_core.conditioning import VideoGeneratedKeyframeSlots
+from ltx_core.conditioning import ConditioningItem, VideoGeneratedKeyframeSlots
 from ltx_core.duration_head import (
     DURATION_HEAD_KEY_OPS,
     DurationHead,
@@ -99,12 +97,11 @@ from ltx_core.types import (
     LatentState,
     SpatioTemporalScaleFactors,
     VideoLatentShape,
-    VideoPixelShape,
 )
-from ltx_pipelines.utils.args import ImageConditioningInput
 from ltx_pipelines.utils.constants import detect_params
 from ltx_pipelines.utils.gpu_model import gpu_model
 from ltx_pipelines.utils.helpers import (
+    assert_stage_supports_generated_keyframes,
     cleanup_memory,
     create_noised_state,
     generate_enhanced_prompt,
@@ -112,7 +109,14 @@ from ltx_pipelines.utils.helpers import (
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.samplers import euler_denoising_loop
-from ltx_pipelines.utils.types import AutoDuration, Denoiser, ModalitySpec, OffloadMode
+from ltx_pipelines.utils.types import (
+    AutoDuration,
+    Denoiser,
+    ImageConditioningInput,
+    ModalitySpec,
+    OffloadMode,
+    VideoAudio,
+)
 
 _ENCODE_MODEL_TYPES = frozenset({"gemma3", "gemma4", "gemma4_unified"})
 
@@ -125,6 +129,8 @@ ModelWrapper = Callable[[torch.nn.Module, "LatentTools | None"], torch.nn.Module
 
 T = TypeVar("T")
 _M = TypeVar("_M", bound=torch.nn.Module)
+
+DenoisingLoop = Callable[..., VideoAudio[LatentState]]
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +236,7 @@ def _build_state(
         dtype=dtype,
         device=device,
         noise_scale=spec.noise_scale,
-        initial_latent=spec.initial_latent,
+        initial_latent=spec.latent,
     )
     if spec.frozen:
         state = replace(
@@ -320,22 +326,13 @@ class DiffusionStage:
         ``__init__`` itself takes an already-built builder.
         ``model_configurator`` / ``model_sd_ops`` let callers (e.g. the audio-only
         T2A pipeline) override the model class configurator and the state-dict key
-        mapping. A quantization policy that pins its own configurator takes
-        precedence over ``model_configurator``.
+        mapping.
         """
-        # A quantization policy may pin its own configurator; otherwise use the one
-        # provided by the caller (defaults to the audio-video LTXModelConfigurator).
-        configurator = (
-            quantization.model_configurator
-            if quantization is not None and quantization.model_configurator is not None
-            else model_configurator
-        )
-
         transformer_builder: ModelBuilderProtocol[LTXModelProtocol]
         if offload_mode == OffloadMode.NONE:
             transformer_builder = Builder(
                 model_path=checkpoint_path,
-                model_class_configurator=configurator,
+                model_class_configurator=model_configurator,
                 model_sd_ops=model_sd_ops,
                 loras=tuple(loras),
                 registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
@@ -343,7 +340,7 @@ class DiffusionStage:
         else:
             transformer_builder = cls._build_streaming_builder(
                 checkpoint_path=checkpoint_path,
-                configurator=configurator,
+                configurator=model_configurator,
                 model_sd_ops=model_sd_ops,
                 loras=tuple(loras),
                 quantization=quantization,
@@ -409,27 +406,21 @@ class DiffusionStage:
         transformer_config = self._transformer_builder.model_config().get("transformer", {})
         return bool(transformer_config.get("use_keyframes_abs_pos_embedding", False))
 
-    def assert_generated_keyframes_supported(self) -> None:
-        """Raise unless this stage's checkpoint declares the keyframe embedding.
-        Call this from a pipeline's ``__call__`` preamble, before any model is built: the answer
-        comes from the checkpoint config alone, so an unsupported request should fail immediately
-        rather than after the text encoder has been loaded. :meth:`__call__` re-checks as a backstop
-        for callers that build conditioning items directly.
-        """
-        if self.supports_generated_keyframes:
+    def _assert_supports_conditionings(self, conditionings: Sequence[ConditioningItem] | None) -> None:
+        if conditionings is None or self.supports_generated_keyframes:
             return
-        raise ValueError(
-            f"Generated keyframe slots were requested, but the checkpoint at "
-            f"{self._transformer_builder.checkpoint} does not set 'use_keyframes_abs_pos_embedding' "
-            f"in its transformer config, so it has no keyframe absolute-position embedding. Use a "
-            f"generated-keyframe checkpoint or drop the keyframe request."
-        )
+        if any(isinstance(item, VideoGeneratedKeyframeSlots) for item in conditionings):
+            assert_stage_supports_generated_keyframes(self)
 
-    def _assert_supports_conditionings(self, video: ModalitySpec | None) -> None:
-        if video is None or self.supports_generated_keyframes:
-            return
-        if any(isinstance(item, VideoGeneratedKeyframeSlots) for item in video.conditionings):
-            self.assert_generated_keyframes_supported()
+    @property
+    def dtype(self) -> torch.dtype:
+        """Dtype this stage builds its transformer and sizes its latents in."""
+        return self._dtype
+
+    @property
+    def device(self) -> torch.device:
+        """Device this stage builds its transformer and sizes its latents on."""
+        return self._device
 
     def with_attention(self, attention: AttentionFunction | AttentionCallable | None) -> "DiffusionStage":
         """Return a new ``DiffusionStage`` that pins the transformer build to ``attention``.
@@ -519,76 +510,70 @@ class DiffusionStage:
             return self._streaming_transformer_ctx()
         return gpu_model(self._build_transformer(**kwargs), alloc_trim_strategy=self._alloc_trim_strategy)
 
-    def __call__(  # noqa: PLR0913
+    def __call__(
         self,
         denoiser: Denoiser,
         sigmas: torch.Tensor,
         noiser: Noiser,
-        width: int,
-        height: int,
-        frames: int,
-        fps: float,
-        video: ModalitySpec | None = None,
-        audio: ModalitySpec | None = None,
-        stepper: DiffusionStepProtocol | None = None,
-        loop: Callable[..., tuple[LatentState | None, LatentState | None]] | None = None,
+        modalities: VideoAudio[ModalitySpec],
+        loop: DenoisingLoop | None = None,
         max_batch_size: int = 1,
-        audio_fps: float | None = None,
-    ) -> tuple[LatentState | None, LatentState | None]:
+    ) -> VideoAudio[LatentState]:
         """Build transformer -> run denoising loop -> free transformer.
-        Returns ``(video_state | None, audio_state | None)`` with cleared
-        conditionings and unpatchified latents for present modalities.
-        ``fps`` is the transformer's time base: it sets RoPE time (``pixel_frame / fps``)
-        and, by default, the audio latent's duration (``frames / fps``). ``audio_fps``
-        decouples the two for callers that hand the transformer a time base other than the
-        clip's real frame rate -- audio is then sized from ``frames / audio_fps``, so its
-        duration still matches playback. Omitted -> same as ``fps``.
+        Returns a :class:`VideoAudio` of unpatchified :class:`LatentState` with cleared
+        conditionings for present modalities.
         """
+        video, audio = modalities
         if video is None and audio is None:
-            raise ValueError("At least one of `video` or `audio` must be provided")
-        self._assert_supports_conditionings(video)
+            raise ValueError("At least one of `modalities.video` or `modalities.audio` must be provided")
+        if video is not None:
+            self._assert_supports_conditionings(video.conditionings)
 
         if loop is None:
             loop = euler_denoising_loop
-        if stepper is None:
-            stepper = EulerDiffusionStep()
 
-        pixel_shape = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
-        audio_pixel_shape = pixel_shape if audio_fps is None else pixel_shape._replace(fps=audio_fps)
+        video_latent = video.latent if video is not None else None
+        audio_latent = audio.latent if audio is not None else None
+        conditioning_fps = video.conditioning_fps if video is not None else None
 
         # Build video_tools up front so it can be forwarded to the transformer
         # context (required by TiledDataParallelBuilder in multi-GPU mode).
-        video_tools: LatentTools | None = None
-        if video is not None:
-            v_shape = VideoLatentShape.from_pixel_shape(
-                pixel_shape,
+        video_tools = (
+            VideoLatentTools(
+                VideoLatentPatchifier(patch_size=1),
+                VideoLatentShape.from_torch_shape(video_latent.shape),
+                conditioning_fps,
                 scale_factors=self.video_scale_factors,
             )
-            video_tools = VideoLatentTools(
-                VideoLatentPatchifier(patch_size=1), v_shape, fps, scale_factors=self.video_scale_factors
-            )
+            if video_latent is not None
+            else None
+        )
 
         mode = "streaming" if self._is_streaming else "standard"
         logger.info("Building transformer (%s) from %s", mode, self._transformer_builder.checkpoint)
         with self._transformer_ctx(video_tools=video_tools) as built:
             transformer = built if self._model_wrapper is None else self._model_wrapper(built, video_tools)
             logger.info(
-                "Running denoising loop (%d steps, %dx%d %d frames @ %.1f fps)",
+                "Running denoising loop (%d steps, video latent %s, audio latent %s @ %.1f fps)",
                 len(sigmas) - 1,
-                width,
-                height,
-                frames,
-                fps,
+                tuple(video_latent.shape) if video_latent is not None else None,
+                tuple(audio_latent.shape) if audio_latent is not None else None,
+                conditioning_fps,
             )
             video_state: LatentState | None = None
             if video is not None and video_tools is not None:
                 video_state = _build_state(video, video_tools, noiser, self._dtype, self._device)
 
-            audio_tools: LatentTools | None = None
+            audio_tools = (
+                AudioLatentTools(
+                    AudioPatchifier(patch_size=1),
+                    AudioLatentShape.from_torch_shape(audio_latent.shape),
+                )
+                if audio_latent is not None
+                else None
+            )
             audio_state: LatentState | None = None
-            if audio is not None:
-                a_shape = AudioLatentShape.from_video_pixel_shape(audio_pixel_shape)
-                audio_tools = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
+            if audio is not None and audio_tools is not None:
                 audio_state = _build_state(audio, audio_tools, noiser, self._dtype, self._device)
 
             wrapped = BatchSplitAdapter(transformer, max_batch_size=max_batch_size)  # type: ignore[arg-type]
@@ -596,7 +581,6 @@ class DiffusionStage:
                 sigmas=sigmas,
                 video_state=video_state,
                 audio_state=audio_state,
-                stepper=stepper,
                 transformer=wrapped,
                 denoiser=denoiser,
             )
@@ -608,16 +592,14 @@ class DiffusionStage:
                 audio_state = audio_tools.clear_conditioning(audio_state)
                 audio_state = audio_tools.unpatchify(audio_state)
 
-            return video_state, audio_state
+            return VideoAudio(video_state, audio_state)
 
 
 class RecordingDiffusionStage:
     """Wraps a :class:`DiffusionStage` and records the states each call produced.
-    Diagnostics wrapper for a stage's intermediate ``LatentState``s. Generated keyframes that
-    already sit at final output resolution are on ``PipelineOutput.keyframes``; this wrapper
-    remains the way to inspect per-stage states (including half-res stage-1 slots) without a
-    lifecycle callback. Pipelines hold their stage in a plain attribute, so a caller
-    substitutes this in::
+    Diagnostics wrapper for a stage's intermediate ``LatentState``s. Use this to inspect
+    per-stage states (including half-res stage-1 slots) without a lifecycle callback. Pipelines
+    hold their stage in a plain attribute, so a caller substitutes this in::
         pipeline.stage = RecordingDiffusionStage(pipeline.stage)
         result = pipeline(...)
         keyframes = pipeline.stage.generated_keyframes
@@ -632,12 +614,12 @@ class RecordingDiffusionStage:
         self.video_states: list[LatentState] = []
         self.audio_states: list[LatentState | None] = []
 
-    def __call__(self, *args: object, **kwargs: object) -> tuple[LatentState | None, LatentState | None]:
+    def __call__(self, *args: object, **kwargs: object) -> VideoAudio[LatentState]:
         video_state, audio_state = self._stage(*args, **kwargs)  # type: ignore[arg-type]
         if video_state is not None:
             self.video_states.append(video_state)
             self.audio_states.append(audio_state)
-        return video_state, audio_state
+        return VideoAudio(video_state, audio_state)
 
     @property
     def generated_keyframes(self) -> torch.Tensor | None:
@@ -1174,6 +1156,7 @@ class VideoDecoder:
         *,
         dtype: torch.dtype | None = None,
         keyframes: DecodeKeyframes | None = None,
+        device_fn: Callable[[int], str | torch.device] | None = None,
     ) -> Iterator[torch.Tensor]:
         """Decode *latent* to pixel-space video chunks. Decoder freed after exhaustion.
         ``dtype`` overrides the constructor dtype for this call only (e.g. float32 for
@@ -1189,6 +1172,8 @@ class VideoDecoder:
         logger.info("Building video decoder from %s", self._checkpoint_path)
         decoder = self._prepared_builder().build(device=self._device, dtype=build_dtype).eval()
         extra = {} if keyframes is None else {"keyframes": keyframes}
+        if device_fn is not None:
+            extra["device_fn"] = device_fn
         chunks = decoder.decode_video(latent, tiling_config, generator, **extra)
         return _cleanup_iter(
             chunks,
@@ -1205,8 +1190,9 @@ class VideoDecoder:
     ) -> Iterator[torch.Tensor]:
         """Decode each latent as its own one-frame clip on one VAE build, then free it.
         A causal VAE cannot decode stacked independent planes without bleeding neighbours.
-        Dist builds still decode locally on every rank; this does not go through the
-        split/gather ``decode_video`` path whose workers yield nothing.
+        A Dist build splits the list across its ranks and gathers the pixels back, so every
+        rank returns the whole list; it does not go through the volume-splitting
+        ``decode_video`` path, whose workers yield nothing.
         """
         if not latents:
             return iter(())

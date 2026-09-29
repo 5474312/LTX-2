@@ -9,6 +9,8 @@ _DEFAULT_ALL2ALL_TIMEOUT_SECONDS = 10.0
 
 
 class AttentionManager:
+    """Owns sequence-parallel attention state for an aggregate token capacity."""
+
     def __init__(
         self,
         max_tokens: int,
@@ -29,12 +31,12 @@ class AttentionManager:
         hidden_dim = num_heads * head_dim
         num_sms = torch.cuda.get_device_properties(self.rank).multi_processor_count
         self.copy_out = copy_out_
-        buffer_seqlen = (max_tokens + self.world_size - 1) // self.world_size
+        max_rank_tokens = (max_tokens + self.world_size - 1) // self.world_size
         self.all2all_heads, self.all2all_q = (
             All2All(
                 rank=self.rank,
                 world_size=self.world_size,
-                seqlen=buffer_seqlen,
+                seqlen=max_rank_tokens,
                 hidden_dim=hidden_dim,
                 num_sms=num_sms,
                 tensor_dtype=tensor_dtype,
@@ -46,7 +48,7 @@ class AttentionManager:
             All2All(
                 rank=self.rank,
                 world_size=self.world_size,
-                seqlen=buffer_seqlen,
+                seqlen=max_rank_tokens,
                 hidden_dim=hidden_dim,
                 num_sms=num_sms,
                 tensor_dtype=tensor_dtype,
@@ -58,14 +60,6 @@ class AttentionManager:
         )
         self.group = group
         self._all2all_timeout_seconds = _DEFAULT_ALL2ALL_TIMEOUT_SECONDS
-
-    def set_seqlen_all2all(self, seqlens: list[int]) -> None:
-        # Route through the wrappers so the registered custom ops' fake-impl
-        # shape info gets updated alongside the C++ runtime's rank_tokens.
-        self.all2all_q.set_rank_tokens(seqlens)
-        self.all2all_k.set_rank_tokens(seqlens)
-        self.all2all_v.set_rank_tokens(seqlens)
-        self.all2all_heads.set_rank_tokens(seqlens)
 
     @property
     def all2all_timeout_seconds(self) -> float:

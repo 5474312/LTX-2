@@ -38,7 +38,7 @@ from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
 from ltx_pipelines.multigpu.weight_tracker import TransformerWeightTracker
 from ltx_pipelines.ti2vid_two_stages_hq import TI2VidTwoStagesHQPipeline
 from ltx_pipelines.utils.constants import TDP_DISTILLED_SIGMAS
-from ltx_pipelines.utils.media_io import HDRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
+from ltx_pipelines.utils.media_io import EXRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration
 
@@ -178,8 +178,9 @@ class TI2VidTwoStagesHQRunner(MGPURunner):
         images: list | None = None,
         enhance_prompt: bool = False,
         enhance_static_cache: bool = False,
-        hdr: HDRColorSpace | None = None,
+        hdr: EXRColorSpace | None = None,
         generated_keyframes: int | Sequence[int] = 0,
+        decode_with_keyframes: bool = False,
     ) -> Iterator[str | None]:
         # The pipeline raises ValueError on invalid input (symmetric across ranks); the controller
         # catches that and turns it into a recoverable RunnerError. Anything else is fatal.
@@ -203,6 +204,7 @@ class TI2VidTwoStagesHQRunner(MGPURunner):
             enhance_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
             generated_keyframes=generated_keyframes,
+            decode_with_keyframes=decode_with_keyframes,
             stage_2_sigmas=TDP_DISTILLED_SIGMAS,
         )
         if dist.get_rank() != _DRIVER_RANK:
@@ -220,11 +222,13 @@ class TI2VidTwoStagesHQRunner(MGPURunner):
 
 
 if __name__ == "__main__":
-    from ltx_pipelines.utils.args import add_generated_keyframes_arg, hq_2_stage_arg_parser
+    from ltx_pipelines.utils.args import add_generated_keyframes_arg, add_keyframe_decode_arg, hq_2_stage_arg_parser
     from ltx_pipelines.utils.constants import LTX_2_3_HQ_PARAMS
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    parser = add_generated_keyframes_arg(hq_2_stage_arg_parser(params=LTX_2_3_HQ_PARAMS, supports_auto_duration=True))
+    parser = add_keyframe_decode_arg(
+        add_generated_keyframes_arg(hq_2_stage_arg_parser(params=LTX_2_3_HQ_PARAMS, supports_auto_duration=True))
+    )
     args = parser.parse_args()
 
     vae_queue = torch.multiprocessing.get_context("spawn").SimpleQueue()
@@ -272,6 +276,7 @@ if __name__ == "__main__":
             enhance_static_cache=args.enhance_static_cache,
             hdr=args.hdr,
             generated_keyframes=args.num_generated_keyframes,
+            decode_with_keyframes=args.decode_with_keyframes,
         ):
             pass  # drive the job to completion; the runner writes the file as a side effect
     finally:

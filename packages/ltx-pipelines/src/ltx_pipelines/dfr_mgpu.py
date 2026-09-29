@@ -271,6 +271,7 @@ class DFRRunner(MGPURunner):
                 enhance_static_cache=enhance_static_cache,
                 temporal_upscalings=temporal_upscalings,
                 spatial_upscalings=spatial_upscalings,
+                decode_device_fn=lambda _: self._pipeline.device,
             )
         if dist.get_rank() != _DRIVER_RANK:
             yield None  # workers: nothing to encode

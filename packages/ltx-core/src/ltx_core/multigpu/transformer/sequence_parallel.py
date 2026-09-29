@@ -307,7 +307,6 @@ class SequenceParallelModelWrapper(torch.nn.Module):
                 f"Total video token count ({total_tokens}) exceeds attention_manager max_tokens "
                 f"({self.attention_manager.max_tokens}). Use a smaller resolution or fewer frames."
             )
-        self.attention_manager.set_seqlen_all2all(token_counts)
         torch.distributed.barrier(self.attention_manager.group)
         video, audio = self.model(video_tile, audio, perturbations)
         video = gather_output_tokens(video, token_counts, self.attention_manager.group)

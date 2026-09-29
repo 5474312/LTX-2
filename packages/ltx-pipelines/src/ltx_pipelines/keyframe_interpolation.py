@@ -18,7 +18,6 @@ from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import VideoPixelShape
 from ltx_pipelines.utils.args import (
-    ImageConditioningInput,
     default_2_stage_arg_parser,
     resolve_cli_params,
 )
@@ -36,19 +35,26 @@ from ltx_pipelines.utils.constants import (
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
+    create_initial_av_latents,
     ensure_tiling_config,
     get_device,
     image_conditionings_by_adding_guiding_latent,
     tiling_scale_factors_for_vae,
 )
 from ltx_pipelines.utils.media_io import (
-    HDRColorSpace,
+    EXRColorSpace,
     encode_video,
     resolve_hdr_color_space,
     vae_dtype_for_hdr,
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
+from ltx_pipelines.utils.types import (
+    ImageConditioningInput,
+    ModalitySpec,
+    OffloadMode,
+    PipelineOutput,
+    VideoAudio,
+)
 
 
 class KeyframeInterpolationPipeline:
@@ -163,7 +169,7 @@ class KeyframeInterpolationPipeline:
         max_batch_size: int = 1,
         stage_1_sigmas: torch.Tensor | None = None,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
-        color_space: HDRColorSpace | None = None,
+        color_space: EXRColorSpace | None = None,
     ) -> PipelineOutput:
         images = self.image_conditioner.resolve_crf(images)
         assert_resolution(height=height, width=width, is_two_stage=True)
@@ -226,6 +232,15 @@ class KeyframeInterpolationPipeline:
             negative_context=a_context_n,
         )
 
+        video_latent, audio_latent = create_initial_av_latents(
+            width=stage_1_output_shape.width,
+            height=stage_1_output_shape.height,
+            frames=num_frames,
+            fps=frame_rate,
+            device=self.device,
+            dtype=self.dtype,
+            video_scale_factors=self.stage_1.video_scale_factors,
+        )
         video_state, audio_state = self.stage_1(
             denoiser=FactoryGuidedDenoiser(
                 v_context=v_context_p,
@@ -235,16 +250,18 @@ class KeyframeInterpolationPipeline:
             ),
             sigmas=sigmas,
             noiser=noiser,
-            width=stage_1_output_shape.width,
-            height=stage_1_output_shape.height,
-            frames=num_frames,
-            fps=frame_rate,
-            video=ModalitySpec(
-                context=v_context_p,
-                conditionings=stage_1_conditionings,
-            ),
-            audio=ModalitySpec(
-                context=a_context_p,
+            modalities=VideoAudio(
+                video=ModalitySpec(
+                    latent=video_latent,
+                    conditioning_fps=frame_rate,
+                    context=v_context_p,
+                    conditionings=stage_1_conditionings,
+                ),
+                audio=ModalitySpec(
+                    latent=audio_latent,
+                    conditioning_fps=frame_rate,
+                    context=a_context_p,
+                ),
             ),
             max_batch_size=max_batch_size,
         )
@@ -270,26 +287,26 @@ class KeyframeInterpolationPipeline:
             denoiser=SimpleDenoiser(v_context_p, a_context_p),
             sigmas=stage_2_sigmas,
             noiser=noiser,
-            width=width,
-            height=height,
-            frames=num_frames,
-            fps=frame_rate,
-            video=ModalitySpec(
-                context=v_context_p,
-                conditionings=stage_2_conditionings,
-                noise_scale=stage_2_sigmas[0].item(),
-                initial_latent=upscaled_video_latent,
-            ),
-            audio=ModalitySpec(
-                context=a_context_p,
-                noise_scale=stage_2_sigmas[0].item(),
-                initial_latent=audio_state.latent,
+            modalities=VideoAudio(
+                video=ModalitySpec(
+                    latent=upscaled_video_latent,
+                    conditioning_fps=frame_rate,
+                    context=v_context_p,
+                    conditionings=stage_2_conditionings,
+                    noise_scale=stage_2_sigmas[0].item(),
+                ),
+                audio=ModalitySpec(
+                    latent=audio_state.latent,
+                    conditioning_fps=frame_rate,
+                    context=a_context_p,
+                    noise_scale=stage_2_sigmas[0].item(),
+                ),
             ),
         )
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
         decoded_audio = self.audio_decoder(audio_state.latent)
-        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
+        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config)
 
 
 @torch.inference_mode()

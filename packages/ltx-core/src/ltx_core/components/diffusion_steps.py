@@ -56,10 +56,6 @@ class EulerAncestralDiffusionStep(DiffusionStepProtocol):
     only at ``eta=0``.
     """
 
-    def __init__(self, eta: float = 1.0, s_noise: float = 1.0) -> None:
-        self.eta = eta
-        self.s_noise = s_noise
-
     def step(
         self,
         sample: torch.Tensor,
@@ -67,6 +63,8 @@ class EulerAncestralDiffusionStep(DiffusionStepProtocol):
         sigmas: torch.Tensor,
         step_index: int,
         noise: torch.Tensor | None = None,
+        eta: float = 1.0,
+        s_noise: float = 1.0,
         **_kwargs,
     ) -> torch.Tensor:
         """Advance one ancestral Euler step.
@@ -77,6 +75,10 @@ class EulerAncestralDiffusionStep(DiffusionStepProtocol):
             step_index: Current step index.
             noise: Noise tensor for the renoise term. Required when ``eta > 0``;
                 unused (and may be ``None``) when ``eta == 0``.
+            eta: Stochastic noise injection strength. ``0`` is a plain Euler
+                step; ``1`` is fully ancestral. Default ``1.0``.
+            s_noise: Scale on the injected noise. Default ``1.0``. At ``0`` the
+                step still applies its variance-preserving rescale.
         Returns:
             Updated latent x_{t-1}, or ``denoised_sample`` when the next sigma is 0.
         """
@@ -84,25 +86,25 @@ class EulerAncestralDiffusionStep(DiffusionStepProtocol):
         sigma_next = sigmas[step_index + 1].to(torch.float32)
         if sigma_next == 0:
             return denoised_sample.to(sample.dtype)
-        if self.eta > 0 and noise is None:
+        if eta > 0 and noise is None:
             raise ValueError("EulerAncestralDiffusionStep requires a noise tensor when eta > 0")
 
         x = sample.to(torch.float32)
         denoised = denoised_sample.to(torch.float32)
 
-        downstep_ratio = 1.0 + (sigma_next / sigma - 1.0) * self.eta
+        downstep_ratio = 1.0 + (sigma_next / sigma - 1.0) * eta
         sigma_down = sigma_next * downstep_ratio
 
         # Euler step to sigma_down, expressed as an interpolation between x and x_0.
         sigma_down_ratio = sigma_down / sigma
         x_next = sigma_down_ratio * x + (1.0 - sigma_down_ratio) * denoised
 
-        if self.eta > 0:
+        if eta > 0:
             # Renoise from sigma_down back up to sigma_next.
             alpha_next = 1.0 - sigma_next
             alpha_down = 1.0 - sigma_down
             renoise_coeff = (sigma_next**2 - sigma_down**2 * alpha_next**2 / alpha_down**2).clamp(min=0) ** 0.5
-            x_next = (alpha_next / alpha_down) * x_next + noise.to(torch.float32) * self.s_noise * renoise_coeff
+            x_next = (alpha_next / alpha_down) * x_next + noise.to(torch.float32) * s_noise * renoise_coeff
         return x_next.to(sample.dtype)
 
 
@@ -201,10 +203,6 @@ class EulerCfgPpDiffusionStep(DiffusionStepProtocol):
     Reference: CFG++ (https://arxiv.org/abs/2406.08070).
     """
 
-    def __init__(self, eta: float = 1.0, s_noise: float = 1.0) -> None:
-        self.eta = eta
-        self.s_noise = s_noise
-
     def step(
         self,
         sample: torch.Tensor,
@@ -213,6 +211,8 @@ class EulerCfgPpDiffusionStep(DiffusionStepProtocol):
         step_index: int,
         uncond_denoised: torch.Tensor,
         noise: torch.Tensor | None = None,
+        eta: float = 1.0,
+        s_noise: float = 1.0,
         **_kwargs,
     ) -> torch.Tensor:
         """Advance one CFG++ Euler step.
@@ -225,6 +225,8 @@ class EulerCfgPpDiffusionStep(DiffusionStepProtocol):
                 used to compute the ODE derivative direction.
             noise: Noise tensor for stochastic injection; ignored when
                 ``eta=0`` or ``s_noise=0``.
+            eta: Stochastic noise injection strength. Default ``1.0``.
+            s_noise: Scale on the injected noise. Default ``1.0``.
         Returns:
             Updated latent x_{t-1}.
         """
@@ -243,10 +245,10 @@ class EulerCfgPpDiffusionStep(DiffusionStepProtocol):
         d = (x - alpha_s * uncond) / sigma_s
 
         # Ancestral step in rescaled sigma space (sigma / alpha)
-        sigma_down, sigma_up = _get_ancestral_step(sigma_s / alpha_s, sigma_t / alpha_t, eta=self.eta)
+        sigma_down, sigma_up = _get_ancestral_step(sigma_s / alpha_s, sigma_t / alpha_t, eta=eta)
         sigma_down = alpha_t * sigma_down
 
         x_next = alpha_t * denoised + sigma_down * d
-        if noise is not None and self.eta > 0 and self.s_noise > 0:
-            x_next = x_next + alpha_t * noise.to(torch.float32) * self.s_noise * sigma_up
+        if noise is not None and eta > 0 and s_noise > 0:
+            x_next = x_next + alpha_t * noise.to(torch.float32) * s_noise * sigma_up
         return x_next.to(sample.dtype)

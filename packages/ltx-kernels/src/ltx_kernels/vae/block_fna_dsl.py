@@ -41,7 +41,6 @@ parts and why.
 
 import dataclasses
 import functools
-import os
 from typing import Any, NamedTuple
 
 import cutlass
@@ -51,6 +50,12 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.utils import SmemAllocator
 
+from ltx_kernels.vae.aot import (
+    KERNEL_CACHE,
+    fake_dynamic_matrix,
+    fake_dynamic_vector,
+    fake_dynamic_weight,
+)
 from ltx_kernels.vae.availability import UNSUPPORTED_MESSAGE, gpu_supports_dsl_kernels
 from ltx_kernels.vae.fna_attn_core import (
     _as_rows,
@@ -124,8 +129,6 @@ from ltx_kernels.vae.keyframe_slots import (
     nearest_video_frames,
     tile_plane_union,
 )
-
-_COMPILED: "dict[tuple, Any]" = {}
 
 # Channel counts the kernel is compiled and validated for. The shipped DiffVAE only
 # ever asks for 256 (stage 5); 128 is kept because it is the cheap shape to validate
@@ -2226,46 +2229,56 @@ def run_block_fna_dsl(
         x_.device,
     )
 
-    compiled = _compile(
-        C=C,
-        Ctx=Ctx,
-        upsample_stride=tuple(upsample_stride),
-        Hidd=Hidd,
-        num_heads=num_heads,
-        rope_dim_split=rope_dim_split,
-        kernel_size=kernel_size,
-        tile_thw=tile,
-        keyframes=kf.enabled,
-    )
-    compiled(
-        _dyn_act(_as_rows(x_)),
-        _dyn_act(_as_rows(ctx_)),
-        _dyn_act(y_buf),
-        _dyn_act(kv_cache),
-        _dyn(norm_cache),
-        _dyn(barrier),
-        *kf.operands,
-        bf(w_ctx),
-        bf(w_q),
-        bf(_pack_kv(w_k, w_v, num_heads)),
-        bf(w_o),
-        bf(w_gate),
-        bf(w_up),
-        bf(w_down),
-        _dyn(channel_params),
-        f32(inv_t),
-        f32(inv_h),
-        f32(inv_w),
-        *_runtime_scalars(
-            volume=(T, H, W),
-            ctx_volume=(T_lo, H_lo, W_lo),
-            drop_leading=drop,
-            n_ctas=n_ctas,
-            plan=plan,
-            n_kf=kf.n_kf,
-            kf_cache_row_stride=kf.cache_row_stride,
-        ),
-    )
+    with torch.cuda.device(x_.device):
+        # ``keyframes`` keys the binary so the no-keyframe kernel keeps exactly the trace, and
+        # the register allocation, it had before the keyframe stream existed.
+        # Everything else here is structural too, and must stay that way. The per-tile plane
+        # union bound used to be in this key; because it moves with the clip length it recompiled
+        # the ladder on every new duration, which cost 12+ minutes of in-process MLIR before a
+        # 545-frame decode could start. It is now ``SLOTS * TT``, a constant of ``tile_thw``.
+        compiled = KERNEL_CACHE.get(
+            _compile_kernel,
+            x_.device,
+            C=C,
+            Ctx=Ctx,
+            upsample_stride=tuple(upsample_stride),
+            Hidd=Hidd,
+            num_heads=num_heads,
+            rope_dim_split=rope_dim_split,
+            kernel_size=kernel_size,
+            tile_thw=tile,
+            slab_box_max=SLAB_BOX_MAX,
+            keyframes=kf.enabled,
+        )
+        compiled(
+            _dyn_act(_as_rows(x_)),
+            _dyn_act(_as_rows(ctx_)),
+            _dyn_act(y_buf),
+            _dyn_act(kv_cache),
+            _dyn(norm_cache),
+            _dyn(barrier),
+            *kf.operands,
+            bf(w_ctx),
+            bf(w_q),
+            bf(_pack_kv(w_k, w_v, num_heads)),
+            bf(w_o),
+            bf(w_gate),
+            bf(w_up),
+            bf(w_down),
+            _dyn(channel_params),
+            f32(inv_t),
+            f32(inv_h),
+            f32(inv_w),
+            *_runtime_scalars(
+                volume=(T, H, W),
+                ctx_volume=(T_lo, H_lo, W_lo),
+                drop_leading=drop,
+                n_ctas=n_ctas,
+                plan=plan,
+                n_kf=kf.n_kf,
+                kf_cache_row_stride=kf.cache_row_stride,
+            ),
+        )
     video_out = y_buf[: T * H * W].view(T, H, W, C).unsqueeze(0).to(dtype=x.dtype)
     if not kf.enabled:
         return video_out
@@ -2345,26 +2358,26 @@ def _launch(
     inv_t,
     inv_h,
     inv_w,
-    T,
-    H,
-    W,
-    T_lo,
-    H_lo,
-    W_lo,
-    drop_leading,
-    n_ctas,
-    slab_count,
-    slab_grid_hw,
-    slab_grid_w,
-    slab_tiles_t,
-    slab_tiles_h,
-    slab_tiles_w,
-    max_box_t,
-    max_box_h,
-    max_box_w,
-    cache_row_stride,
-    n_kf,
-    kf_cache_row_stride,
+    T: cutlass.Int32,
+    H: cutlass.Int32,
+    W: cutlass.Int32,
+    T_lo: cutlass.Int32,
+    H_lo: cutlass.Int32,
+    W_lo: cutlass.Int32,
+    drop_leading: cutlass.Int32,
+    n_ctas: cutlass.Int32,
+    slab_count: cutlass.Int32,
+    slab_grid_hw: cutlass.Int32,
+    slab_grid_w: cutlass.Int32,
+    slab_tiles_t: cutlass.Int32,
+    slab_tiles_h: cutlass.Int32,
+    slab_tiles_w: cutlass.Int32,
+    max_box_t: cutlass.Int32,
+    max_box_h: cutlass.Int32,
+    max_box_w: cutlass.Int32,
+    cache_row_stride: cutlass.Int32,
+    n_kf: cutlass.Int32,
+    kf_cache_row_stride: cutlass.Int32,
     C: cutlass.Constexpr,
     Ctx: cutlass.Constexpr,
     SP_T: cutlass.Constexpr,
@@ -2519,7 +2532,7 @@ def _launch(
     ).launch(grid=[n_ctas, 1, 1], block=[THREADS, 1, 1])
 
 
-def _compile(
+def _compile_kernel(
     *,
     C: int,
     Hidd: int,
@@ -2529,30 +2542,12 @@ def _compile(
     tile_thw: "tuple[int, int, int]",
     Ctx: int | None = None,
     upsample_stride: "tuple[int, int, int]" = (1, 1, 1),
+    slab_box_max: "tuple[int, int, int]" = SLAB_BOX_MAX,
     keyframes: bool = False,
+    options: str | None = None,
 ):
+    """Compile one structural key from storage-free ABI descriptors."""
     Ctx = C if Ctx is None else Ctx
-    # ``keyframes`` keys the binary so the no-keyframe kernel keeps exactly the trace, and
-    # the register allocation, it had before the keyframe stream existed.
-    # Everything else here is structural too, and must stay that way. The per-tile plane
-    # union bound used to be in this key; because it moves with the clip length it recompiled
-    # the ladder on every new duration, which cost 12+ minutes of in-process MLIR before a
-    # 545-frame decode could start. It is now ``SLOTS * TT``, a constant of ``tile_thw``.
-    key = (
-        C,
-        Ctx,
-        upsample_stride,
-        Hidd,
-        num_heads,
-        rope_dim_split,
-        tile_thw,
-        kernel_size,
-        MAXP_TOKENS,
-        SLAB_BOX_MAX,
-        keyframes,
-    )
-    if key in _COMPILED:
-        return _COMPILED[key]
     kt, kh, kw = kernel_size
     tt, th, tw = tile_thw
     panel = (tt + kt - 1, th + kh - 1, tw + kw - 1)
@@ -2563,53 +2558,51 @@ def _compile(
     # Halo-box bounds are compile-time, so the rope tables are fixed-size; the box's
     # actual extents come from ``_choose_slab`` at runtime, which is what keeps T/H/W
     # dynamic. A one-tile slab is the floor, so the panel itself has to fit.
-    if any(p > b for p, b in zip(panel, SLAB_BOX_MAX, strict=True)) or panel[0] * panel[1] * panel[2] > MAXP_TOKENS:
-        raise ValueError(f"halo panel {panel} exceeds the slab box bound {SLAB_BOX_MAX}")
-    hd = C // num_heads
-    subpixels = upsample_stride[0] * upsample_stride[1] * upsample_stride[2]
-    dev = torch.device("cuda")
+    if any(p > b for p, b in zip(panel, slab_box_max, strict=True)) or panel[0] * panel[1] * panel[2] > MAXP_TOKENS:
+        raise ValueError(f"halo panel {panel} exceeds the slab box bound {slab_box_max}")
 
-    def act(a: int, b: int):
-        return _dyn_act(torch.zeros(a, b, device=dev, dtype=torch.bfloat16))
+    def activation():
+        return fake_dynamic_matrix(cutlass.BFloat16, assumed_align=16)
 
-    def weight(a: int, b: int):
-        return _dyn_w(torch.zeros(a, b, device=dev, dtype=torch.bfloat16))
+    def weight(columns: int):
+        return fake_dynamic_weight(cutlass.BFloat16, columns=columns)
 
-    def vec(n: int):
-        return _dyn(torch.zeros(n, device=dev, dtype=torch.float32))
+    def f32_vector():
+        return fake_dynamic_vector(cutlass.Float32)
+
+    def i32_vector():
+        return fake_dynamic_vector(cutlass.Int32)
 
     # Shapes here only have to be *typed* right: every extent the kernel reads is a
     # runtime argument, so the stand-ins can be as small as their layouts allow.
     trace_plan = _SlabPlan(core=(1, 1, 1), box=(1, 1, 1), grid=(1, 1, 1))
 
-    # Pass-through for CuTe DSL compiler flags, e.g. --keep-sass / --ptxas-options=-v.
-    opts = os.environ.get("CUTE_DSL_OPTS")
-    _COMPILED[key] = cute.compile(
+    return cute.compile(
         _launch,
-        act(M, C),  # x
-        act(M, Ctx),  # stage4
-        act(M, C),  # y
-        act(2 * num_heads * M, hd),  # kv_cache -- its head stride is a runtime argument
-        vec(2 * M),  # norm_cache
-        _dyn(torch.zeros(2, device=dev, dtype=torch.int32)),  # barrier
-        act(M, C),  # x_kf
-        act(M, Ctx),  # stage4_kf
-        act(M, C),  # y_kf
-        act(2 * num_heads * M, hd),  # kv_cache_kf
-        vec(2 * M),  # norm_cache_kf
-        vec(1),  # kf_times
-        *(_dyn(torch.zeros(max(n, 1), device=dev, dtype=torch.int32)) for n in (1, 1, 1, 1, 1, 1)),
-        weight(subpixels * C, Ctx),  # w_ctx -- the fused upsample x context_proj
-        weight(C, C),  # w_q
-        weight(2 * C, C),  # w_kv
-        weight(C, C),  # w_o
-        weight(Hidd, C),  # w_gate
-        weight(Hidd, C),  # w_up
-        weight(C, Hidd),  # w_down
-        vec(_channel_param_offsets(C, hd, subpixels)["total"]),  # channel_params
-        vec(max(rope_dim_split[0] // 2, 1)),  # inv_t
-        vec(max(rope_dim_split[1] // 2, 1)),  # inv_h
-        vec(max(rope_dim_split[2] // 2, 1)),  # inv_w
+        activation(),  # x
+        activation(),  # stage4
+        activation(),  # y
+        activation(),  # kv_cache -- its head stride is a runtime argument
+        f32_vector(),  # norm_cache
+        i32_vector(),  # barrier
+        activation(),  # x_kf
+        activation(),  # stage4_kf
+        activation(),  # y_kf
+        activation(),  # kv_cache_kf
+        f32_vector(),  # norm_cache_kf
+        f32_vector(),  # kf_times
+        *(i32_vector() for _ in range(6)),
+        weight(Ctx),  # w_ctx -- the fused upsample x context_proj
+        weight(C),  # w_q
+        weight(C),  # w_kv
+        weight(C),  # w_o
+        weight(C),  # w_gate
+        weight(C),  # w_up
+        weight(Hidd),  # w_down
+        f32_vector(),  # channel_params
+        f32_vector(),  # inv_t
+        f32_vector(),  # inv_h
+        f32_vector(),  # inv_w
         *_runtime_scalars(volume=(4, 4, 4), ctx_volume=(4, 4, 4), drop_leading=0, n_ctas=1, plan=trace_plan),
         *_static_shape(
             C=C,
@@ -2620,11 +2613,11 @@ def _compile(
             rope_dim_split=rope_dim_split,
             kernel_size=kernel_size,
             tile_thw=tile_thw,
+            slab_box_max=slab_box_max,
             keyframes=keyframes,
         ),
-        **({"options": opts} if opts else {}),
+        **({"options": options} if options else {}),
     )
-    return _COMPILED[key]
 
 
 def _runtime_scalars(
@@ -2667,6 +2660,7 @@ def _static_shape(
     rope_dim_split: "tuple[int, int, int]",
     kernel_size: "tuple[int, int, int]",
     tile_thw: "tuple[int, int, int]",
+    slab_box_max: "tuple[int, int, int]",
     keyframes: bool = False,
 ) -> tuple:
     """The kernel's compile-time arguments, in signature order."""
@@ -2691,7 +2685,7 @@ def _static_shape(
         tw,
         *panel,
         n_kv,
-        *SLAB_BOX_MAX,
+        *slab_box_max,
         keyframes,
         KEYFRAME_CONTEXT_SLOTS,
         # The stride into ``kf_planes``: a tile's ``TT`` timesteps contribute at most

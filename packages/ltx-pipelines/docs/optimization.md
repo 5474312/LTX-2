@@ -312,12 +312,11 @@ Instead of the standard Euler denoising loop, you can use gradient estimation fo
 from ltx_pipelines.utils import gradient_estimating_euler_denoising_loop
 
 # Use gradient estimation denoising loop
-def denoising_loop(sigmas, video_state, audio_state, stepper):
+def denoising_loop(sigmas, video_state, audio_state):
     return gradient_estimating_euler_denoising_loop(
         sigmas=sigmas,
         video_state=video_state,
         audio_state=audio_state,
-        stepper=stepper,
         transformer=transformer,
         denoiser=denoiser,
         ge_gamma=2.0,  # Gradient estimation coefficient

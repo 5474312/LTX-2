@@ -26,6 +26,7 @@ class VideoConditionByReferenceLatent(ConditioningItem):
         latent: Reference video latents [B, C, F, H, W].
         downscale_factor: Target/reference spatial ratio (e.g. 2 = half-res ref).
         temporal_scale_factor: Target/reference temporal ratio S (e.g. 4 = ref at 1/4 fps).
+        first_latent_frame: Temporal-grid index assigned to the first frame of ``latent``.
         strength: Conditioning strength. 1.0 = full (reference kept clean),
             0.0 = none (reference denoised). Default 1.0.
     """
@@ -36,11 +37,15 @@ class VideoConditionByReferenceLatent(ConditioningItem):
         downscale_factor: int = 1,
         temporal_scale_factor: int = 1,
         strength: float = 1.0,
+        first_latent_frame: int = 0,
     ):
+        if first_latent_frame < 0:
+            raise ValueError(f"first_latent_frame must be >= 0, got {first_latent_frame}")
         self.latent = latent
         self.downscale_factor = downscale_factor
         self.temporal_scale_factor = temporal_scale_factor
         self.strength = strength
+        self.first_latent_frame = first_latent_frame
 
     def apply_to(
         self,
@@ -54,6 +59,9 @@ class VideoConditionByReferenceLatent(ConditioningItem):
             output_shape=VideoLatentShape.from_torch_shape(self.latent.shape),
             device=self.latent.device,
         )
+        if self.first_latent_frame:
+            latent_coords = latent_coords.clone()
+            latent_coords[:, 0, :, :] += self.first_latent_frame
         positions = get_pixel_coords(
             latent_coords=latent_coords,
             scale_factors=latent_tools.scale_factors,

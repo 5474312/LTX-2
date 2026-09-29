@@ -5,6 +5,9 @@ rank).  Each rank decodes its assigned tiles sequentially.  Workers
 put their list of decoded tiles into a ``mp.Queue`` (CUDA IPC —
 zero-copy handle sharing).  The driver collects all tiles, blends
 overlap zones, and returns temporal batches distributed across devices.
+``decode_single_frames`` splits a *list of independent one-frame clips* instead of one
+volume: the planes go round-robin to the ranks and come back through an all-gather, so
+each is decoded once and every rank still holds the whole list.
 The tiling configuration comes from ``MGPUConfig.vae_tiling`` (set at
 construction time), NOT from the pipeline's SGPU tiling kwarg.  MGPU
 tiling controls parallelism; SGPU tiling controls single-GPU VRAM
@@ -26,10 +29,12 @@ from ltx_core.model.disposable import Disposable
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.video_vae import (
     VideoDecoder,
+    clip_generators,
     iter_decoded_single_frames,
     map_spatial_slice,
     map_temporal_slice,
     to_mapping_operation,
+    validate_single_frame_latents,
 )
 from ltx_core.tiling import (
     Tile,
@@ -82,6 +87,20 @@ def dist_rank_tiles(
         raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
     all_tiles = create_distributed_tiles(vae_tiling, latent_shape, scale)
     return [t for i, t in enumerate(all_tiles) if i % world_size == rank]
+
+
+def dist_rank_plane_indices(count: int, rank: int, world_size: int) -> list[int]:
+    """Round-robin share of ``count`` independent single-frame clips owned by ``rank``.
+    The same assignment rule as :func:`dist_rank_tiles`, on a list of whole clips instead of
+    tiles of one volume. Fewer clips than ranks, or a ragged tail, simply leaves the trailing
+    ranks with a shorter (possibly empty) share -- there is nothing to pad, because every rank
+    still joins the gather that follows.
+    """
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+    return list(range(rank, count, world_size))
 
 
 def dist_rank_tile_pixel_shape(
@@ -278,9 +297,10 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
         latent: torch.Tensor,
         tiling_config: TilingConfig | None = None,
         generator: torch.Generator | None = None,
-        device_fn: Callable[[int], str | torch.device] | None = None,
         *,
         keyframes: DecodeKeyframes | None = None,
+        device_fn: Callable[[int], str | torch.device] | None = None,
+        **_kwargs: object,
     ) -> Iterator[torch.Tensor]:
         """Distributed decode — all ranks decode, driver assembles.
         Not a generator so that worker side-effects (decode + queue.put)
@@ -335,12 +355,68 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
         latents: Sequence[torch.Tensor],
         generator: torch.Generator | Sequence[torch.Generator | None] | None = None,
     ) -> Iterator[torch.Tensor]:
-        """Local SGPU decode of each T=1 clip on every rank. Does not Dist-split or gather.
-        ``decode_video`` on Dist is the wrong tool here: workers send their tile and yield
-        nothing. Carry-keyframe planes are independent one-frame clips, so every rank
-        decodes them on the inner decoder and keeps the pixels.
+        """Split the one-frame clips round-robin over the group, then all-gather the pixels.
+        Each plane is an independent clip, so there is nothing to tile and nothing to blend:
+        rank ``r`` decodes planes ``r, r + W, r + 2W, ...`` on the inner SGPU decoder and every
+        rank ends up holding the whole list, in the order the latents were given. A DiffVAE
+        plane is expensive enough that decoding all of them on every rank -- what this used to
+        do -- wastes ``W - 1`` GPUs per plane.
+        ``decode_video`` is still the wrong tool here: it splits one volume, and its workers
+        yield nothing after queueing their tile.
+        Not a generator. The all-gather has to run on every rank whether or not the caller
+        iterates the result, and a rank whose share is empty (fewer planes than ranks, or a
+        ragged tail) still takes part with an empty payload instead of skipping the collective
+        -- one absent participant blocks the group until the NCCL timeout.
+        Pixels cross the group as CPU tensors: ``all_gather_object`` pickles a CUDA tensor with
+        its source device index, so a plane decoded on ``cuda:3`` would be rebuilt on ``cuda:3``
+        on every rank. Each plane is moved onto the device of its own latent on the way out, and
+        a rank keeps the GPU copy of the planes it decoded itself.
+        With a per-plane ``generator`` sequence the pixels do not depend on the world size. A
+        single shared generator (or ``None``) is drawn from independently on each rank, so with
+        those the noise a given plane gets does.
         """
-        yield from iter_decoded_single_frames(self.decoder, latents, generator)
+        if not latents:
+            return iter(())
+        validate_single_frame_latents(latents)
+        gens = clip_generators(len(latents), generator)
+        if self.world_size == 1:
+            return iter_decoded_single_frames(self.decoder, latents, gens)
+        if len(latents) > 1 and not isinstance(generator, Sequence):
+            logger.warning(
+                "Dist single-frame decode is splitting %d planes over %d ranks with a shared "
+                "generator; each rank draws its own noise, so the pixels depend on the world "
+                "size. Pass one generator per latent to keep them world-size invariant.",
+                len(latents),
+                self.world_size,
+            )
+
+        my_indices = dist_rank_plane_indices(len(latents), self.rank, self.world_size)
+        logger.info(
+            "Dist single-frame decode: rank %d of %d takes %d of %d planes",
+            self.rank,
+            self.world_size,
+            len(my_indices),
+            len(latents),
+        )
+        decoded = iter_decoded_single_frames(
+            self.decoder, [latents[i] for i in my_indices], [gens[i] for i in my_indices]
+        )
+        mine: dict[int, torch.Tensor] = dict(zip(my_indices, decoded, strict=True))
+
+        payload = [(index, pixels.to("cpu")) for index, pixels in mine.items()]
+        shares: list[list[tuple[int, torch.Tensor]] | None] = [None] * self.world_size
+        dist.all_gather_object(shares, payload, group=self.vae_group)
+        merged: dict[int, torch.Tensor] = {}
+        for share in shares:
+            merged.update(dict(share or ()))
+        # This rank's own planes are already on the right device; prefer them over the round trip.
+        merged.update(mine)
+        missing = [index for index in range(len(latents)) if index not in merged]
+        if missing:
+            raise RuntimeError(f"Dist single-frame decode lost planes {missing} in the all-gather")
+        # Lazy on the way out: the collective already ran, and the caller usually consumes one
+        # plane at a time, so only the ranks' own planes stay resident on the GPU.
+        return (merged[index].to(latents[index].device) for index in range(len(latents)))
 
     # ------------------------------------------------------------------
     # Private helpers

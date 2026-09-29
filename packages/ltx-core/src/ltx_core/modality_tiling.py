@@ -21,6 +21,7 @@ from ltx_core.tiling import (
     SplitOperation,
     Tile,
     TileCountConfig,
+    TileSizeConfig,
     create_tiles,
     identity_mapping_operation,
     split_at_seams,
@@ -95,7 +96,7 @@ class VideoModalityTilingHelper:
 
     def __init__(
         self,
-        tiling: TileCountConfig,
+        tiling: TileCountConfig | TileSizeConfig,
         video_tools: VideoLatentTools,
         seams: Sequence[int] = (),
     ) -> None:
@@ -104,7 +105,11 @@ class VideoModalityTilingHelper:
         self._num_generated_tokens = self._patchifier.get_token_count(self._latent_shape)
         frames, height, width = tiling.to_splitters(video_tools.scale_factors, causal_temporal=False)
         frames_mapper = identity_mapping_operation
-        seam_op = seam_split(seams, self._latent_shape.frames, tiling.frames)
+        if seams and not isinstance(tiling, TileCountConfig):
+            raise ValueError("Known temporal seams require count-based tiling")
+        seam_op = (
+            seam_split(seams, self._latent_shape.frames, tiling.frames) if isinstance(tiling, TileCountConfig) else None
+        )
         if seam_op is not None:
             frames, frames_mapper = seam_op, partial(identity_mapping_operation, rectangular=True)
         self._tiles = create_tiles(

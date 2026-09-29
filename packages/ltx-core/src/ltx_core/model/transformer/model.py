@@ -7,15 +7,10 @@ from ltx_core.guidance.perturbations import BatchedPerturbationConfig, Perturbat
 from ltx_core.model.disposable import Disposable
 from ltx_core.model.model_protocol import LTXModelProtocol
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
-from ltx_core.model.transformer.attention import attention_label
+from ltx_core.model.transformer.attention import AttentionOps, attention_label
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
-from ltx_core.model.transformer.transformer import (
-    DEFAULT_TRANSFORMER_OPS,
-    BasicAVTransformerBlock,
-    TransformerConfig,
-    TransformerOpsConfig,
-)
+from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
 from ltx_core.model.transformer.transformer_args import (
     BlockPerturbationsProcessor,
     MultiModalTransformerArgsPreprocessor,
@@ -56,7 +51,7 @@ class LTXModel(torch.nn.Module, Disposable):
         num_layers: int = 48,
         cross_attention_dim: int = 4096,
         norm_eps: float = 1e-06,
-        ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS,
+        attention_ops: AttentionOps | None = None,
         positional_embedding_theta: float = 10000.0,
         positional_embedding_max_pos: list[int] | None = None,
         timestep_scale_multiplier: int = 1000,
@@ -80,14 +75,15 @@ class LTXModel(torch.nn.Module, Disposable):
         use_keyframes_abs_pos_embedding: bool = False,
     ):
         super().__init__()
+        attention_ops = attention_ops or AttentionOps()
         # Log the attention backends this transformer is built with. Reading the resolved
         # ``label`` off the ops reports whatever was selected -- AUTOMATIC, an explicit pin
         # (PYTORCH/FA3/FA4/SDPA_*), or a directly supplied callable -- so this is the
         # single source of truth for which kernel a build uses. Fires once per build.
         logger.info(
             "Building transformer with attention backends -- self: %s, masked: %s",
-            attention_label(ops.attention_ops.attention_function),
-            attention_label(ops.attention_ops.masked_attention_function),
+            attention_label(attention_ops.attention_function),
+            attention_label(attention_ops.masked_attention_function),
         )
         self._enable_gradient_checkpointing = False
         self.cross_attention_adaln = cross_attention_adaln
@@ -141,7 +137,7 @@ class LTXModel(torch.nn.Module, Disposable):
             audio_attention_head_dim=audio_attention_head_dim if model_type.is_audio_enabled() else 0,
             audio_cross_attention_dim=audio_cross_attention_dim,
             norm_eps=norm_eps,
-            ops=ops,
+            attention_ops=attention_ops,
             apply_gated_attention=apply_gated_attention,
             ff_bias=ff_bias,
             audio_ff_bias=audio_ff_bias,
@@ -372,7 +368,7 @@ class LTXModel(torch.nn.Module, Disposable):
         audio_attention_head_dim: int,
         audio_cross_attention_dim: int,
         norm_eps: float,
-        ops: TransformerOpsConfig,
+        attention_ops: AttentionOps | None,
         apply_gated_attention: bool,
         ff_bias: bool = True,
         audio_ff_bias: bool = True,
@@ -411,7 +407,7 @@ class LTXModel(torch.nn.Module, Disposable):
                     audio=audio_config,
                     rope_type=self.rope_type,
                     norm_eps=norm_eps,
-                    ops=ops,
+                    attention_ops=attention_ops,
                 )
                 for _ in range(num_layers)
             ]

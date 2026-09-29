@@ -1,46 +1,73 @@
 import argparse
+import enum
 import json
 import logging
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
+from ltx_pipelines.chunks import ChunkConfig
 from ltx_pipelines.utils.constants import (
     DEFAULT_LORA_STRENGTH,
     DEFAULT_NEGATIVE_PROMPT,
     LTX_2_3_HQ_PARAMS,
     LTX_2_3_PARAMS,
+    LTX_2_4_PARAMS,
     PipelineParams,
     detect_params,
 )
+from ltx_pipelines.utils.media_io.color_config import EXRColorSpace
+from ltx_pipelines.utils.media_io.exr import is_exr_dir
+from ltx_pipelines.utils.media_io.inputs import EXRVideoInput, VideoInput
 from ltx_pipelines.utils.quantization_factory import QuantizationKind
-from ltx_pipelines.utils.types import AutoDuration, OffloadMode
+from ltx_pipelines.utils.types import AutoDuration, ImageConditioningInput, OffloadMode
 
 logger = logging.getLogger(__name__)
 
 
+class HDRICLoraInputColorSpace(str, enum.Enum):
+    """Supported HDR IC-LoRA input colorspaces."""
+
+    SRGB_GAMMA = "srgb_gamma"
+    SRGB = "srgb"
+    ACESCG = "acescg"
+    ACESCCT = "acescct"
+
+
+_VIDEO_GAMMA: dict[HDRICLoraInputColorSpace, bool] = {
+    HDRICLoraInputColorSpace.SRGB_GAMMA: True,
+    HDRICLoraInputColorSpace.SRGB: False,
+}
+
+_EXR_SPACES: dict[HDRICLoraInputColorSpace, EXRColorSpace] = {
+    HDRICLoraInputColorSpace.SRGB: EXRColorSpace.SRGB_LINEAR,
+    HDRICLoraInputColorSpace.ACESCG: EXRColorSpace.ACESCG,
+    HDRICLoraInputColorSpace.ACESCCT: EXRColorSpace.ACESCCT,
+}
+
+_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
+
+
 def add_hdr_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add ``--hdr`` colour-space flag. Behaviour is implemented in ``media_io``."""
-    from ltx_pipelines.utils.media_io.color_config import HDRColorSpace  # noqa: PLC0415
+    names = [m.name for m in EXRColorSpace]
 
-    names = [m.name for m in HDRColorSpace]
-
-    def _parse_hdr(value: str) -> HDRColorSpace:
+    def _parse_hdr(value: str) -> EXRColorSpace:
         key = value.upper()
         try:
-            return HDRColorSpace[key]
+            return EXRColorSpace[key]
         except KeyError as exc:
             raise argparse.ArgumentTypeError(f"invalid --hdr {value!r}; choose from {', '.join(names)}") from exc
 
     parser.add_argument(
         "--hdr",
         type=_parse_hdr,
-        choices=[HDRColorSpace[n] for n in names],
+        choices=[EXRColorSpace[n] for n in names],
         default=None,
         metavar="{" + ",".join(names) + "}",
         help=(
@@ -49,20 +76,6 @@ def add_hdr_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     return parser
-
-
-class ImageConditioningInput(NamedTuple):
-    """An image to condition on, with the H.264 CRF it should be re-compressed at.
-    Leaving ``crf`` unset means "use whatever matches the model": the pipeline fills it in
-    from the checkpoint it runs (``ImageConditioner.resolve_crf``), since the value the model
-    was trained with is a property of the model generation. Pass ``crf`` explicitly to
-    override it, including ``0`` to skip re-compression entirely.
-    """
-
-    path: str
-    frame_idx: int
-    strength: float
-    crf: int | None = None
 
 
 class VideoConditioningAction(argparse.Action):
@@ -366,22 +379,7 @@ def _resolve_num_frames(namespace: argparse.Namespace) -> None:
         namespace.num_frames = namespace.auto_duration if namespace.auto_duration is not None else AutoDuration()
 
 
-def _is_exr_file(path: str | Path) -> bool:
-    return Path(path).is_file() and str(path).lower().endswith(".exr")
-
-
-def _verify_sequence_path(flag: str, path: str) -> None:
-    """Video/sequence flags accept a video file or a directory of ``*.exr`` frames."""
-    from ltx_pipelines.utils.media_io import is_exr_dir  # noqa: PLC0415
-
-    p = Path(path)
-    if _is_exr_file(path):
-        raise SystemExit(f"{flag} '{path}' is a single .exr file; pass a directory of *.exr frames.")
-    if p.is_dir() and not is_exr_dir(path):
-        raise SystemExit(f"{flag} '{path}' is a directory without *.exr frames.")
-
-
-def _verify_media_path_args(namespace: argparse.Namespace) -> None:  # noqa: PLR0912
+def _verify_media_path_args(namespace: argparse.Namespace) -> None:
     """Validate HDR/SDR path shapes and couple retake ``--frame-rate`` to EXR folders.
     Rules:
     * ``--image``: a still file (``.exr`` or PNG/JPEG). Not a directory.
@@ -393,8 +391,6 @@ def _verify_media_path_args(namespace: argparse.Namespace) -> None:  # noqa: PLR
     * Dub-It ``--reference-video``: video file only (fps + audio from the container). EXR
       folders / single ``.exr`` files are rejected.
     """
-    from ltx_pipelines.utils.media_io import is_exr_dir  # noqa: PLC0415
-
     modality: list[tuple[str, str, bool]] = []  # (flag, path, is_exr)
 
     for img in getattr(namespace, "images", None) or []:
@@ -437,17 +433,7 @@ def _verify_media_path_args(namespace: argparse.Namespace) -> None:  # noqa: PLR
         if is_exr_dir(video_path):
             modality.append(("--video-path", video_path, True))
         if hasattr(namespace, "frame_rate"):
-            if is_exr_dir(video_path):
-                if namespace.frame_rate is None:
-                    raise SystemExit(
-                        f"--video-path '{video_path}' is an EXR-frame folder; --frame-rate is required "
-                        "(EXR sequences have no container fps)."
-                    )
-            elif namespace.frame_rate is not None:
-                raise SystemExit(
-                    "--frame-rate is only valid when --video-path is an EXR-frame folder; "
-                    "for video files the container fps is used."
-                )
+            _verify_sequence_frame_rate("--video-path", video_path, namespace.frame_rate)
 
     if any(is_exr for _, _, is_exr in modality) and getattr(namespace, "hdr", None) is None:
         raise SystemExit("EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space.")
@@ -464,7 +450,77 @@ class _PipelineArgumentParser(argparse.ArgumentParser):
         _resolve_model_paths(ns)
         _resolve_num_frames(ns)
         _verify_media_path_args(ns)
+        _resolve_hdr_ic_lora_input(ns)
         return ns
+
+
+def _is_exr_file(path: str | Path) -> bool:
+    return Path(path).is_file() and str(path).lower().endswith(".exr")
+
+
+def _verify_sequence_path(flag: str, path: str) -> None:
+    """Video/sequence flags accept a video file or a directory of ``*.exr`` frames."""
+    p = Path(path)
+    if _is_exr_file(path):
+        raise SystemExit(f"{flag} '{path}' is a single .exr file; pass a directory of *.exr frames.")
+    if p.is_dir() and not is_exr_dir(path):
+        raise SystemExit(f"{flag} '{path}' is a directory without *.exr frames.")
+
+
+def _verify_sequence_frame_rate(flag: str, path: str, frame_rate: float | None) -> None:
+    """Require ``--frame-rate`` for EXR-frame folders; forbid it for video files."""
+    if is_exr_dir(path):
+        if frame_rate is None:
+            raise SystemExit(
+                f"{flag} '{path}' is an EXR-frame folder; --frame-rate is required "
+                "(EXR sequences have no container fps)."
+            )
+    elif frame_rate is not None:
+        raise SystemExit(
+            f"--frame-rate is only valid when {flag} is an EXR-frame folder; for video files the container fps is used."
+        )
+
+
+def _resolve_hdr_ic_lora_input(namespace: argparse.Namespace) -> None:
+    """Map ``--input`` / ``--input-colorspace`` / ``--frame-rate`` to VideoInput or EXRVideoInput."""
+    has_input = hasattr(namespace, "input")
+    has_colorspace = hasattr(namespace, "input_colorspace")
+    if has_input != has_colorspace:
+        raise SystemExit("--input and --input-colorspace are required together")
+    if not has_colorspace:
+        return
+    input_path = namespace.input
+    if input_path is None:
+        raise SystemExit("HDR IC-LoRA requires --input")
+
+    _verify_sequence_path("--input", input_path)
+
+    try:
+        cs = HDRICLoraInputColorSpace(namespace.input_colorspace)
+    except ValueError:
+        raise SystemExit(
+            f"invalid --input-colorspace {namespace.input_colorspace!r}; "
+            f"expected one of {', '.join(m.value for m in HDRICLoraInputColorSpace)}"
+        ) from None
+
+    path = Path(input_path)
+    fps = getattr(namespace, "frame_rate", None)
+
+    if not is_exr_dir(path):
+        if path.suffix.lower() not in _VIDEO_SUFFIXES:
+            raise SystemExit(f"expected an MP4/MOV file or a directory of *.exr frames; got {path}")
+        if cs not in _VIDEO_GAMMA:
+            raise SystemExit(f"--input-colorspace {cs.value} expects a directory of *.exr frames; got {path}")
+        if fps is not None:
+            raise SystemExit("--frame-rate is only valid for an EXR-frame folder")
+        namespace.input = VideoInput(path, gamma_encoded=_VIDEO_GAMMA[cs])
+        return
+
+    if cs not in _EXR_SPACES:
+        raise SystemExit(f"--input-colorspace {cs.value} expects an MP4/MOV file; got EXR frames at {path}")
+    if fps is None:
+        raise SystemExit("EXR-frame folder requires --frame-rate")
+    namespace.input = EXRVideoInput(path, color_space=_EXR_SPACES[cs], frame_rate=fps)
 
 
 def detect_checkpoint_path(distilled: bool = False) -> str:
@@ -505,11 +561,24 @@ def resolve_cli_params(distilled: bool = False) -> PipelineParams:
     return detect_params(detect_checkpoint_path(distilled=distilled))
 
 
-def basic_arg_parser(
-    params: PipelineParams = LTX_2_3_PARAMS,
+def add_model_args(
+    parser: argparse.ArgumentParser,
+    *,
+    params: PipelineParams,
     distilled: bool = False,
+    text_encoder: bool = True,
+    audio_vae: bool = True,
+    duration_head: bool = True,
 ) -> argparse.ArgumentParser:
-    parser = _PipelineArgumentParser()
+    """Add the model-component path flags.
+    One flag group per component, so a pipeline declares only the components it loads and
+    ``model_paths_from_namespace`` sees exactly those. Turning a component off matters beyond
+    tidiness for ``text_encoder``: that switch covers ``--gemma-root`` *and*
+    ``--text-encoder-path``, the monolith and split halves of one component, and
+    ``model_paths_from_namespace`` requires ``--gemma-root`` in monolith mode only when the
+    parser declares it. A CLI with precomputed embeddings must therefore leave it out rather
+    than accept it and ignore it.
+    """
     if distilled:
         parser.add_argument(
             "--distilled-checkpoint-path",
@@ -541,16 +610,17 @@ def basic_arg_parser(
                 f"Higher values improve quality but increase generation time (default: {params.num_inference_steps})."
             ),
         )
-    parser.add_argument(
-        "--gemma-root",
-        type=resolve_existing_path,
-        required=False,
-        default=None,
-        help=(
-            "Path to the Gemma text encoder HF directory (monolith mode). "
-            "Omit when using --text-encoder-path (split single-file TE)."
-        ),
-    )
+    if text_encoder:
+        parser.add_argument(
+            "--gemma-root",
+            type=resolve_existing_path,
+            required=False,
+            default=None,
+            help=(
+                "Path to the Gemma text encoder HF directory (monolith mode). "
+                "Omit when using --text-encoder-path (split single-file TE)."
+            ),
+        )
     parser.add_argument(
         "--transformer-path",
         type=resolve_existing_path,
@@ -560,12 +630,13 @@ def basic_arg_parser(
             "Provide the subset of split flags this pipeline needs; unused may be omitted."
         ),
     )
-    parser.add_argument(
-        "--text-encoder-path",
-        type=resolve_existing_path,
-        default=None,
-        help="Split layout: Gemma + text_embedding_projection single-file safetensors.",
-    )
+    if text_encoder:
+        parser.add_argument(
+            "--text-encoder-path",
+            type=resolve_existing_path,
+            default=None,
+            help="Split layout: Gemma + text_embedding_projection single-file safetensors.",
+        )
     parser.add_argument(
         "--video-vae-path",
         type=resolve_existing_path,
@@ -576,18 +647,83 @@ def basic_arg_parser(
             "(e.g. a distilled DiffVAE). Decoder kind is selected from file metadata."
         ),
     )
+    if audio_vae:
+        parser.add_argument(
+            "--audio-vae-path",
+            type=resolve_existing_path,
+            default=None,
+            help="Split layout: audio VAE + vocoder safetensors.",
+        )
+    if duration_head:
+        parser.add_argument(
+            "--duration-head-path",
+            type=resolve_existing_path,
+            default=None,
+            help="Split layout: duration head safetensors (omit if unused / unavailable).",
+        )
+    return parser
+
+
+def add_seed_arg(
+    parser: argparse.ArgumentParser,
+    *,
+    params: PipelineParams,
+) -> argparse.ArgumentParser:
+    """Add ``--seed``."""
     parser.add_argument(
-        "--audio-vae-path",
-        type=resolve_existing_path,
-        default=None,
-        help="Split layout: audio VAE + vocoder safetensors.",
+        "--seed",
+        type=int,
+        default=params.seed,
+        help=f"Random seed for reproducible generation (default: {params.seed}).",
     )
+    return parser
+
+
+def add_offload_arg(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add ``--offload``, the weight offloading strategy."""
     parser.add_argument(
-        "--duration-head-path",
-        type=resolve_existing_path,
-        default=None,
-        help="Split layout: duration head safetensors (omit if unused / unavailable).",
+        "--offload",
+        dest="offload_mode",
+        type=OffloadMode,
+        default=OffloadMode.NONE,
+        choices=list(OffloadMode),
+        help=(
+            "Weight offloading strategy. "
+            "'none' keeps all weights on GPU (default). "
+            "'cpu' pins weights in CPU RAM, streams to GPU per layer. "
+            "'disk' reads weights from disk on demand (lowest memory). "
+            "Example: --offload cpu"
+        ),
     )
+    return parser
+
+
+def add_diffvae_optimization_arg(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add ``--diffvae-optimization``, the DiffVAE decode preset."""
+    parser.add_argument(
+        "--diffvae-optimization",
+        type=DiffVAEMode,
+        default=DiffVAEMode.CHUNKED_EAGER,
+        choices=list(DiffVAEMode),
+        help=(
+            "DiffVAE decode optimization preset. "
+            "'chunked_eager' (default): deferred stage-4, W-chunks=4, cutlass-fna. "
+            "'chunked_compile': same chunking with torch.compile (det stages off). "
+            "'combined_compile': combined context, full compile (highest VRAM, fastest warm). "
+            "'blackwell_dsl': deferred stage-4 + CuTe DSL NA/fused stage-5 (datacenter Blackwell). "
+            "Ignored for convolutional VAEs. "
+            "Example: --diffvae-optimization combined_compile"
+        ),
+    )
+    return parser
+
+
+def basic_arg_parser(
+    params: PipelineParams = LTX_2_3_PARAMS,
+    distilled: bool = False,
+) -> argparse.ArgumentParser:
+    parser = _PipelineArgumentParser()
+    add_model_args(parser, params=params, distilled=distilled)
     parser.add_argument(
         "--prompt",
         type=str,
@@ -600,12 +736,7 @@ def basic_arg_parser(
         required=True,
         help="Path to the output video file (MP4 format).",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=params.seed,
-        help=f"Random seed for reproducible generation (default: {params.seed}).",
-    )
+    add_seed_arg(parser, params=params)
     parser.add_argument(
         "--lora",
         dest="lora",
@@ -650,21 +781,7 @@ def basic_arg_parser(
         except ValueError as e:
             raise argparse.ArgumentTypeError(f"must be an integer, got {value}") from e
 
-    # Weight offloading
-    parser.add_argument(
-        "--offload",
-        dest="offload_mode",
-        type=OffloadMode,
-        default=OffloadMode.NONE,
-        choices=list(OffloadMode),
-        help=(
-            "Weight offloading strategy. "
-            "'none' keeps all weights on GPU (default). "
-            "'cpu' pins weights in CPU RAM, streams to GPU per layer. "
-            "'disk' reads weights from disk on demand (lowest memory). "
-            "Example: --offload cpu"
-        ),
-    )
+    add_offload_arg(parser)
 
     parser.add_argument(
         "--max-batch-size",
@@ -713,21 +830,7 @@ def basic_arg_parser(
             "--compile inductor_config='{\"max_autotune\": true}'"
         ),
     )
-    parser.add_argument(
-        "--diffvae-optimization",
-        type=DiffVAEMode,
-        default=DiffVAEMode.CHUNKED_EAGER,
-        choices=list(DiffVAEMode),
-        help=(
-            "DiffVAE decode optimization preset. "
-            "'chunked_eager' (default): deferred stage-4, W-chunks=4, cutlass-fna. "
-            "'chunked_compile': same chunking with torch.compile (det stages off). "
-            "'combined_compile': combined context, full compile (highest VRAM, fastest warm). "
-            "'blackwell_dsl': deferred stage-4 + CuTe DSL NA/fused stage-5 (datacenter Blackwell). "
-            "Ignored for convolutional VAEs. "
-            "Example: --diffvae-optimization combined_compile"
-        ),
-    )
+    add_diffvae_optimization_arg(parser)
     return parser
 
 
@@ -855,6 +958,88 @@ def add_generated_keyframes_arg(parser: argparse.ArgumentParser) -> argparse.Arg
     return parser
 
 
+def add_keyframe_decode_arg(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add ``--decode-with-keyframes`` to a pipeline that supports generated keyframe slots."""
+    parser.add_argument(
+        "--decode-with-keyframes",
+        action="store_true",
+        default=False,
+        help=(
+            "Decode the output video through the keyframe-aware DiffVAE path, using the "
+            "generated keyframe slots as anchors. Requires --num-generated-keyframes > 0 and "
+            "a keyframe-trained video VAE. Conv VAEs log a warning and decode without anchors."
+        ),
+    )
+    return parser
+
+
+def chunk_config_from_args(args: argparse.Namespace) -> ChunkConfig | None:
+    """Build ``ChunkConfig`` from CLI args, or ``None`` when chunking is disabled."""
+    chunked = getattr(args, "chunked", False)
+    chunk_pixel_frames = getattr(args, "chunk_pixel_frames", None)
+    chunk_carry_frames = getattr(args, "chunk_carry_frames", None)
+    chunk_blend_frames = getattr(args, "chunk_blend_frames", None)
+    if not chunked and chunk_pixel_frames is None and chunk_carry_frames is None and chunk_blend_frames is None:
+        return None
+    kwargs: dict[str, int] = {}
+    if chunk_pixel_frames is not None:
+        kwargs["chunk_pixel_frames"] = chunk_pixel_frames
+    if chunk_carry_frames is not None:
+        kwargs["next_video_carry_frames"] = chunk_carry_frames
+    if chunk_blend_frames is not None:
+        kwargs["overlap_blend_frames"] = chunk_blend_frames
+    return ChunkConfig(**kwargs)
+
+
+def add_chunk_layout_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add chunking flags for long-video mode.
+    With ``--chunked`` or any layout flag, ``stream_chunks`` uses a windowed layout.
+    Omitted sizing values use ``ChunkConfig`` defaults (97 pixel frames, 25-pixel carry,
+    crossfade over the full carry). With no chunk flags, the clip runs as one window.
+    """
+    parser.add_argument(
+        "--chunked",
+        action="store_true",
+        help=(
+            "Generate long clips in overlapping temporal windows using the default chunk "
+            "layout (97-frame windows, 25-frame carry, crossfade over the full overlap). "
+            "Override the layout with --chunk-pixel-frames, --chunk-carry-frames, "
+            "and --chunk-blend-frames."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-pixel-frames",
+        type=int,
+        default=None,
+        help=(
+            "Pixel frames in each chunked window (default: 97 when --chunk-carry-frames is set). "
+            "Must be a causal-grid length such as 97 (8k+1). The stitched clip floors --num-frames "
+            "to the causal grid when it is off-grid (for example 240 becomes 233); smaller windows "
+            "produce more chunks."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-carry-frames",
+        type=int,
+        default=None,
+        help=(
+            "Pixel frames each chunk passes to the next chunk for overlap continuity "
+            "(default: 25 when --chunk-pixel-frames is set). Must be on the causal grid (8k+1), "
+            "at least 17 when chunking, and less than the chunk window."
+        ),
+    )
+    parser.add_argument(
+        "--chunk-blend-frames",
+        type=int,
+        default=None,
+        help=(
+            "Decoded video frames crossfaded at each chunk seam (default: the full carry). "
+            "Must be between 0 and --chunk-carry-frames; 0 uses a hard cut."
+        ),
+    )
+    return parser
+
+
 def video_editing_arg_parser(
     distilled: bool = True,
 ) -> argparse.ArgumentParser:
@@ -884,6 +1069,120 @@ def video_editing_arg_parser(
     parser.add_argument("--start-time", type=float, required=True, help="Start time of the region to regenerate (s).")
     parser.add_argument("--end-time", type=float, required=True, help="End time of the region to regenerate (s).")
     add_hdr_args(parser)
+    return parser
+
+
+def hdr_ic_lora_arg_parser(params: PipelineParams = LTX_2_4_PARAMS) -> argparse.ArgumentParser:
+    """Argument parser for ACEScct SDR→HDR IC-LoRA (one-stage).
+    Media checks (``--input`` / ``--input-colorspace`` / ``--frame-rate``) run inside
+    :class:`_PipelineArgumentParser.parse_args`.
+    """
+
+    def _parse_exr_colorspace(value: str) -> EXRColorSpace:
+        key = value.upper()
+        try:
+            return EXRColorSpace[key]
+        except KeyError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid --exr-colorspace {value!r}; choose from {', '.join(cs.value for cs in EXRColorSpace)}"
+            ) from exc
+
+    parser = _PipelineArgumentParser(
+        description="ACEScct SDR→HDR IC-LoRA (one-stage). CLI: IDT + EXR/HLG via encode_video.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--input",
+        type=resolve_existing_path,
+        required=True,
+        help=(
+            "One input: MP4/MOV when --input-colorspace is srgb_gamma or srgb, or a directory of "
+            "*.exr frames when srgb, acescg, or acescct. "
+            "Output length matches the source (frame count must be 8k+1)."
+        ),
+    )
+    parser.add_argument(
+        "--output-path",
+        type=resolve_path,
+        required=True,
+        help="Path to the HLG master MP4 (EXR frames go beside it as <stem>_<exr-colorspace>_exr/).",
+    )
+    parser.add_argument(
+        "--exr-colorspace",
+        type=_parse_exr_colorspace,
+        choices=list(EXRColorSpace),
+        default=EXRColorSpace.ACESCG,
+        metavar="{" + ",".join(cs.value for cs in EXRColorSpace) + "}",
+        help=(
+            "Colour space of the EXR sidecar beside --output-path. "
+            "acescg / srgb_linear write scene-linear; acescct writes VAE log codes. "
+            "HLG master is always BT.2020/HLG. Default: acescg."
+        ),
+    )
+    parser.add_argument("--hdr-lora", type=resolve_existing_path, required=True)
+    parser.add_argument(
+        "--text-embeddings",
+        type=resolve_existing_path,
+        required=True,
+        help=".safetensors with video_context.",
+    )
+    # Prompts arrive as precomputed embeddings and there is no audio or duration prediction,
+    # so only the transformer and video VAE components are declared.
+    add_model_args(
+        parser,
+        params=params,
+        distilled=True,
+        text_encoder=False,
+        audio_vae=False,
+        duration_head=False,
+    )
+    parser.add_argument(
+        "--input-colorspace",
+        type=HDRICLoraInputColorSpace,
+        choices=list(HDRICLoraInputColorSpace),
+        default=HDRICLoraInputColorSpace.SRGB_GAMMA,
+        help=(
+            "Source encoding: srgb_gamma=display MP4/MOV (EOTF→ACEScct); "
+            "srgb=linear Rec.709 MP4/MOV or EXR directory; acescg/acescct=EXR directory."
+        ),
+    )
+    parser.add_argument(
+        "--frame-rate",
+        type=float,
+        default=None,
+        help="Required for EXR-frame directories; must not be set for MP4/MOV (container fps).",
+    )
+    add_seed_arg(parser, params=params)
+    parser.add_argument(
+        "--high-quality",
+        action="store_true",
+        help=(
+            "High-quality HDR mode. Generates at 2x frame count internally "
+            "and keeps every other frame for smoother output. ~2x slower."
+        ),
+    )
+    add_offload_arg(parser)
+    parser.add_argument("--no-quantization", action="store_true", help="Disable FP8 cast on the transformer.")
+    add_diffvae_optimization_arg(parser)
+    parser.add_argument(
+        "--no-keyframes",
+        action="store_true",
+        help=(
+            "Disable DFR-style seam keyframes. They are on by default: every "
+            "resolve_canvas x8 border gets a generated HDR slot and a 1-frame SDR "
+            "guide. Requires a transformer with use_keyframes_abs_pos_embedding "
+            "and --video-vae-path pointing at a keyframe-trained video VAE."
+        ),
+    )
+    parser.add_argument(
+        "--keyframe-strength",
+        type=float,
+        default=0.95,
+        help=(
+            "DFR seam keyframe strength when keyframes are on (the default; "
+            "ignored with --no-keyframes). Default: 0.95."
+        ),
+    )
     return parser
 
 

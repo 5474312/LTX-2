@@ -62,6 +62,16 @@ def highest_precision_float(device: DeviceSpec) -> torch.dtype:
     return torch.float64 if supports_float64(device) else torch.float32
 
 
+def allow_async_transfer(device: torch.device) -> bool:
+    """Whether a fused host-to-device + dtype-convert transfer to *device* may be non-blocking.
+    Only CUDA orders a non-blocking transfer against the consuming kernel
+    (same-stream ordering). On MPS the consumer is not fenced against it and
+    may read the destination before the transfer lands, silently corrupting the
+    consuming computation, so transfers block everywhere but CUDA.
+    """
+    return device.type == "cuda"
+
+
 def synchronize_device(device: DeviceSpec = None) -> None:
     """Synchronize CUDA or MPS work if the selected backend supports it."""
     resolved = resolve_device(device)
