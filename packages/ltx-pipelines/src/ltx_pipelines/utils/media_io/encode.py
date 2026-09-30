@@ -30,56 +30,55 @@ logger = logging.getLogger(__name__)
 
 
 def _encode_hdr_video_outputs(
-    chunks: Iterator[torch.Tensor],
+    video: Iterator[torch.Tensor],
     output_path: Path,
     fps: float,
     color_space: EXRColorSpace,
     *,
     max_workers: int = 8,
     audio: Iterator[Audio] | None = None,
+    audio_sampling_rate: int | None = None,
     device: torch.device | None = None,
 ) -> Path:
     """Write EXR frames plus a BT.2020/HLG master.
-    One pass over ``chunks`` feeds two independent sinks:
+    One pass over ``video`` feeds two independent sinks:
     * **HLG** — always Rec.709 scene-linear (``decode_hdr_video`` default).
     * **EXR** — matches ``color_space``: log codes when :attr:`~EXRColorSpace.is_log_working`,
       else scene-linear in ``color_space.source_primaries`` (reuse the HLG tensor when that
       is already Rec.709).
-    Chunks are collected first so a stitch iterator can be pulled before HLG
-    (which takes a single :class:`~ltx_core.types.Audio`). EXR and HLG then share
-    that list.
+    Video tensors flow directly from decode through both sinks. When ``audio`` is
+    deferred, HLG opens its AAC stream from ``audio_sampling_rate`` and pulls
+    the completed track only after this iterator is exhausted.
     Args:
-        chunks: Per-chunk VAE decode output, each ``[F, H, W, C]`` float in ``[0, 1]``
-            (the compressed working-space signal).
+        video: VAE decode output as an iterator of ``[F, H, W, C]`` float tensors in
+            ``[0, 1]`` (the compressed working-space signal), e.g. from
+            :func:`~ltx_pipelines.chunks.split_decoded_chunks`.
         output_path: Destination of the HLG master. EXR frames go to
             ``<stem>_<label>_exr/`` where ``label`` is :func:`~ltx_pipelines.utils.media_io.exr.exr_dir_label`.
         fps: Output frame rate.
         color_space: HDR colour space for EXR tags / linear EXR primaries.
         max_workers: Number of EXR writer threads.
-        audio: Optional stereo track muxed into the HLG master. Drain of ``chunks``
-            fills a lazy stitch iterator; pull it before HLG.
+        audio: Optional stereo track muxed into the HLG master. It may be filled
+            lazily while ``video`` is consumed.
+        audio_sampling_rate: AAC sample rate, required when ``audio`` is set.
         device: Device for the HLG colour conversion. Defaults to CUDA when available.
     Returns:
         The directory the EXR frames were written to.
     Raises:
-        ValueError: If ``chunks`` yields nothing.
+        ValueError: If ``video`` yields nothing.
     """
     exr_dir = output_path.parent / f"{output_path.stem}_{exr_dir_label(color_space)}_exr"
     exr_dir.mkdir(parents=True, exist_ok=True)
     exr_primaries = color_space.source_primaries
     exr_color_space = exr_colorspace_tag(color_space)
     frames_written = 0
-    chunk_list = list(chunks)
-    mux_audio = next(audio, None) if audio is not None else None
-    if mux_audio is not None:
-        validate_audio_waveform(mux_audio)
 
     def hlg_chunks() -> Iterator[torch.Tensor]:
         """Write EXR for each chunk, then yield Rec.709 linear for the HLG encoder."""
         nonlocal frames_written
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             pending: deque[Future[None]] = deque()
-            for chunk in chunk_list:
+            for chunk in video:
                 # HLG sink: always Rec.709 scene-linear.
                 hlg_linear = decode_hdr_video(chunk)
 
@@ -108,17 +107,18 @@ def _encode_hdr_video_outputs(
 
     logger.info(
         "Encoding BT.2020/HLG/10-bit master%s: %s",
-        " (with audio)" if mux_audio is not None else "",
+        " (with audio)" if audio is not None else "",
         output_path,
     )
-    # Empty ``chunks`` raises inside the HLG encoder (after EXR side effects are none).
+    # Empty ``video`` raises inside the HLG encoder (after EXR side effects are none).
     encode_linear_hdr_frames_to_hlg_mp4(
         hlg_chunks(),
         output_path,
         fps=fps,
         primaries=Primaries.REC709,
-        audio=mux_audio,
+        audio=audio,
         device=device,
+        audio_sampling_rate=audio_sampling_rate,
     )
     logger.info(
         "Wrote %d EXR frames (%s/%s) to %s",
@@ -248,9 +248,8 @@ def encode_video(  # noqa: PLR0913
             or None for a video-only file. Pass
             :func:`~ltx_pipelines.chunks.deferred_stitch_audio` when parts are collected
             while ``video`` is consumed, and set ``audio_sampling_rate`` so AAC can open
-            before any video packets (SDR). HDR drains ``video`` first, then pulls that
-            iterator and passes one :class:`~ltx_core.types.Audio` to HLG. Waveforms must
-            be stereo ``(2, N)`` or ``(N, 2)``.
+            before any video packets. Both SDR and HDR pull the iterator only after
+            draining ``video``. Waveforms must be stereo ``(2, N)`` or ``(N, 2)``.
         output_path: Destination path. Parent directories are created if missing.
             Partial SDR output is removed if encoding fails. HDR writes EXR under
             ``<stem>_<label>_exr/`` (see :func:`~ltx_pipelines.utils.media_io.exr.exr_dir_label`) and an
@@ -263,7 +262,7 @@ def encode_video(  # noqa: PLR0913
         color_space: HDR colour space for the encode sink. ``None`` (default) is SDR.
             When set, writes half EXR frames + HLG master.
         audio_sampling_rate: AAC sample rate. Inferred when ``audio`` is an
-            :class:`~ltx_core.types.Audio`; required for an audio iterator on the SDR path.
+            :class:`~ltx_core.types.Audio`; required for an audio iterator.
     Returns:
         EXR output directory when HDR, else ``None``.
     Raises:
@@ -271,6 +270,7 @@ def encode_video(  # noqa: PLR0913
             explicit and embedded audio sampling rates.
     """
     if isinstance(audio, Audio):
+        validate_audio_waveform(audio)
         if audio_sampling_rate is not None and audio_sampling_rate != audio.sampling_rate:
             raise ValueError(
                 f"audio_sampling_rate {audio_sampling_rate} does not match audio sampling rate {audio.sampling_rate}"
@@ -288,6 +288,7 @@ def encode_video(  # noqa: PLR0913
             fps=float(fps),
             color_space=color_space,
             audio=audio,
+            audio_sampling_rate=audio_sampling_rate,
         )
 
     encode_sdr_h264(

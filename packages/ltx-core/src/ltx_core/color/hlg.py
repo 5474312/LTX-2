@@ -196,9 +196,6 @@ def _hlg_encode_planes_threaded(
     encoder: HlgPyAVEncoder,
     plane_chunks: Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]],
     progress_total: int | None = None,
-    *,
-    audio: Audio | None = None,
-    audio_stream: av.audio.AudioStream | None = None,
 ) -> int:
     """libx265-encode planar uint16 chunks on a background thread (1-slot queue)."""
     chunk_queue: Queue[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = Queue(maxsize=1)
@@ -223,9 +220,6 @@ def _hlg_encode_planes_threaded(
         if error is None:
             try:
                 encoder.flush()
-                if audio is not None and audio_stream is not None:
-                    write_audio(encoder.container, audio_stream, audio)
-                encoder.container.close()
             except Exception as e:
                 error = e
         else:
@@ -273,13 +267,27 @@ def encode_linear_hdr_frames_to_hlg_mp4(  # noqa: PLR0913
     progress: bool = False,
     progress_total: int | None = None,
     thread_count: int = 0,
-    audio: Audio | None = None,
+    audio: Audio | Iterator[Audio] | None = None,
     device: torch.device | None = None,
+    audio_sampling_rate: int | None = None,
 ) -> int:
     """Encode scene-linear HDR frames to BT.2020/HLG/10-bit HEVC mp4 via PyAV.
     Consumes ``HxWx3`` / ``FxHxWx3`` chunks one at a time. Conversion runs on
-    ``device``; the encoder thread only muxes planar uint16 into libx265.
+    ``device``; the encoder thread only muxes planar uint16 into libx265. An
+    audio iterator is pulled after all frame chunks have been consumed; pass
+    ``audio_sampling_rate`` so its AAC stream can be opened up front.
     """
+    if isinstance(audio, Audio):
+        validate_audio_waveform(audio)
+        if audio_sampling_rate is not None and audio_sampling_rate != audio.sampling_rate:
+            raise ValueError(
+                f"audio_sampling_rate {audio_sampling_rate} does not match audio sampling rate {audio.sampling_rate}"
+            )
+        audio_sampling_rate = audio.sampling_rate
+        audio = iter((audio,))
+    elif audio is not None and audio_sampling_rate is None:
+        raise ValueError("audio_sampling_rate is required when muxing an audio iterator")
+
     converter = HlgGpuConverter.create(primaries, white_signal, rolloff_k, device=device)
 
     it = iter(frames)
@@ -299,11 +307,6 @@ def encode_linear_hdr_frames_to_hlg_mp4(  # noqa: PLR0913
         thread_count=thread_count,
     )
 
-    audio_stream: av.audio.AudioStream | None = None
-    if audio is not None:
-        validate_audio_waveform(audio)
-        audio_stream = prepare_audio_stream(encoder.container, audio.sampling_rate)
-
     def plane_chunks() -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         y, u, v = converter(first_t)
         yield y.cpu().numpy(), u.cpu().numpy(), v.cpu().numpy()
@@ -312,16 +315,26 @@ def encode_linear_hdr_frames_to_hlg_mp4(  # noqa: PLR0913
             yield y.cpu().numpy(), u.cpu().numpy(), v.cpu().numpy()
 
     try:
+        audio_stream: av.audio.AudioStream | None = None
+        if audio is not None:
+            assert audio_sampling_rate is not None
+            audio_stream = prepare_audio_stream(encoder.container, audio_sampling_rate)
         n = _hlg_encode_planes_threaded(
             encoder,
             plane_chunks(),
             progress_total=progress_total if progress or progress_total is not None else None,
-            audio=audio,
-            audio_stream=audio_stream,
         )
-    except Exception:
+        mux_audio = next(audio, None) if audio is not None else None
+        if mux_audio is not None:
+            validate_audio_waveform(mux_audio)
+            assert audio_stream is not None
+            write_audio(encoder.container, audio_stream, mux_audio)
+    except BaseException:
         Path(out_path).unlink(missing_ok=True)
         raise
+    finally:
+        with contextlib.suppress(Exception):
+            encoder.container.close()
     if progress:
         logger.info("  %d frames", n)
     return n

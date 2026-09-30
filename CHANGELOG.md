@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 - 2026-09-30
+
+### Changed
+
+- HDR video encoding streams decoded chunks directly into EXR and HLG outputs instead of retaining the full clip in memory.
+
 ## 1.4.0 - 2026-09-29
 
 ### Added

@@ -100,6 +100,7 @@ class _A2VidRunContext:
     stage_1_height: int
     encoded_audio_latent: torch.Tensor
     source_audio: Audio
+    chunk_config: ChunkConfig
 
 
 class A2VidPipelineTwoStage:
@@ -215,6 +216,7 @@ class A2VidPipelineTwoStage:
         enhance_static_cache: bool,
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
+        chunk_config: ChunkConfig | None = None,
     ) -> _A2VidRunContext:
         """Validate inputs, decode/encode audio, and resolve frame count / tiling before chunk planning."""
         images = self.image_conditioner.resolve_crf(images)
@@ -241,6 +243,9 @@ class A2VidPipelineTwoStage:
             )
         num_frames = snap_frames_to_grid(num_frames)
 
+        if chunk_config is None:
+            chunk_config = ChunkConfig(chunk_pixel_frames=num_frames, next_video_carry_frames=0)
+
         ctx_p, ctx_n = self.prompt_encoder(
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
@@ -255,7 +260,13 @@ class A2VidPipelineTwoStage:
             tiling_config,
             scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
-            video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
+            video_shape=VideoPixelShape(
+                batch=1,
+                frames=min(num_frames, chunk_config.chunk_pixel_frames),
+                height=height,
+                width=width,
+                fps=frame_rate,
+            ),
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
             keyframes=decode_with_keyframes,
@@ -284,6 +295,7 @@ class A2VidPipelineTwoStage:
             stage_1_height=height // 2,
             encoded_audio_latent=encoded_audio_latent,
             source_audio=source_audio,
+            chunk_config=chunk_config,
         )
 
     def _video_conditionings(
@@ -412,9 +424,8 @@ class A2VidPipelineTwoStage:
             enhance_static_cache=enhance_static_cache,
             generated_keyframes=generated_keyframes,
             decode_with_keyframes=decode_with_keyframes,
+            chunk_config=chunk_config,
         )
-        if chunk_config is None:
-            chunk_config = ChunkConfig(chunk_pixel_frames=ctx.num_frames, next_video_carry_frames=0)
 
         sigmas = (
             stage_1_sigmas if stage_1_sigmas is not None else self._scheduler.execute(steps=num_inference_steps)
@@ -445,7 +456,7 @@ class A2VidPipelineTwoStage:
             context=VideoAudio(video=ctx.v_context_p, audio=ctx.a_context_p),
             device=self.device,
             dtype=ctx.dtype,
-            config=chunk_config,
+            config=ctx.chunk_config,
             video_scale_factors=self.stage_1.video_scale_factors,
             audio_latent=ctx.encoded_audio_latent,
             make_video_conditionings=self._video_conditionings(ctx.images, ctx.num_frames, color_space),

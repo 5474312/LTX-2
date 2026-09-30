@@ -279,6 +279,7 @@ class _ICLoraRunContext:
     conditioning_attention_mask: torch.Tensor | None
     decode_with_keyframes: bool
     color_space: EXRColorSpace | None
+    chunk_config: ChunkConfig
 
 
 class ICLoraPipeline:
@@ -439,6 +440,7 @@ class ICLoraPipeline:
         color_space: EXRColorSpace | None,
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
+        chunk_config: ChunkConfig | None = None,
     ) -> _ICLoraRunContext:
         images = self.image_conditioner.resolve_crf(images)
         assert_generated_keyframes_request(
@@ -464,6 +466,10 @@ class ICLoraPipeline:
             )
 
         resolved_num_frames = snap_frames_to_grid(num_frames)
+
+        if chunk_config is None:
+            chunk_config = ChunkConfig(chunk_pixel_frames=resolved_num_frames, next_video_carry_frames=0)
+
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         resolved_vae_dtype = self.dtype if vae_dtype is None else vae_dtype
@@ -483,7 +489,7 @@ class ICLoraPipeline:
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(
                 batch=1,
-                frames=resolved_num_frames,
+                frames=min(resolved_num_frames, chunk_config.chunk_pixel_frames),
                 height=height,
                 width=width,
                 fps=frame_rate,
@@ -512,6 +518,7 @@ class ICLoraPipeline:
             conditioning_attention_mask=conditioning_attention_mask,
             decode_with_keyframes=decode_with_keyframes,
             color_space=color_space,
+            chunk_config=chunk_config,
         )
 
     def _video_conditionings(
@@ -711,9 +718,8 @@ class ICLoraPipeline:
             color_space=color_space,
             generated_keyframes=generated_keyframes,
             decode_with_keyframes=decode_with_keyframes,
+            chunk_config=chunk_config,
         )
-        if chunk_config is None:
-            chunk_config = ChunkConfig(chunk_pixel_frames=ctx.num_frames, next_video_carry_frames=0)
 
         target = VideoPixelShape(
             batch=1,
@@ -737,7 +743,7 @@ class ICLoraPipeline:
             context=VideoAudio(video=ctx.video_context, audio=ctx.audio_context),
             device=self.device,
             dtype=ctx.dtype,
-            config=chunk_config,
+            config=ctx.chunk_config,
             video_scale_factors=self._diffusion_stage.video_scale_factors,
             generated_keyframes=generated_keyframes,
         )

@@ -153,6 +153,7 @@ class _DistilledRunContext:
     tiling_config: TilingConfig
     stage_1_width: int
     stage_1_height: int
+    chunk_config: ChunkConfig
 
 
 class DistilledPipeline:
@@ -254,6 +255,7 @@ class DistilledPipeline:
         enhance_static_cache: bool,
         generated_keyframes: int | Sequence[int],
         decode_with_keyframes: bool,
+        chunk_config: ChunkConfig | None = None,
     ) -> _DistilledRunContext:
         """Validate inputs, encode prompts, and resolve frame count / tiling before chunk planning."""
         require_num_frames_source(num_frames, self.duration_predictor)
@@ -285,13 +287,20 @@ class DistilledPipeline:
             )
         )
 
+        if chunk_config is None:
+            chunk_config = ChunkConfig(chunk_pixel_frames=resolved_num_frames, next_video_carry_frames=0)
+
         scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
         resolved_tiling_config = ensure_tiling_config(
             tiling_config,
             scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(
-                batch=1, frames=resolved_num_frames, height=height, width=width, fps=frame_rate
+                batch=1,
+                frames=min(resolved_num_frames, chunk_config.chunk_pixel_frames),
+                height=height,
+                width=width,
+                fps=frame_rate,
             ),
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
@@ -310,6 +319,7 @@ class DistilledPipeline:
             tiling_config=resolved_tiling_config,
             stage_1_width=width // 2,
             stage_1_height=height // 2,
+            chunk_config=chunk_config,
         )
 
     def _sampler_kwargs(self, seed: int, noise_seed_offset: int) -> dict[str, Any]:
@@ -435,9 +445,8 @@ class DistilledPipeline:
             enhance_static_cache=enhance_static_cache,
             generated_keyframes=generated_keyframes,
             decode_with_keyframes=decode_with_keyframes,
+            chunk_config=chunk_config,
         )
-        if chunk_config is None:
-            chunk_config = ChunkConfig(chunk_pixel_frames=ctx.num_frames, next_video_carry_frames=0)
 
         stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
@@ -454,7 +463,7 @@ class DistilledPipeline:
             context=VideoAudio(video=ctx.video_context, audio=ctx.audio_context),
             device=self.device,
             dtype=ctx.dtype,
-            config=chunk_config,
+            config=ctx.chunk_config,
             video_scale_factors=self.stage.video_scale_factors,
             make_video_conditionings=self._video_conditionings(ctx.images, ctx.num_frames, color_space),
             generated_keyframes=generated_keyframes,

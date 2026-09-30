@@ -105,6 +105,7 @@ class _DubItRunContext:
     ref_audio_latent: torch.Tensor
     reference_video_path: str
     reference_strength: float
+    chunk_config: ChunkConfig
 
 
 class DubItPipeline:
@@ -211,6 +212,7 @@ class DubItPipeline:
         tiling_config: TilingConfig | AutoTiling | None,
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
+        chunk_config: ChunkConfig | None = None,
     ) -> _DubItRunContext:
         """Validate inputs, encode prompts/reference, and resolve frame count / tiling before chunk planning."""
         images = self.image_conditioner.resolve_crf(images)
@@ -220,6 +222,9 @@ class DubItPipeline:
         meta = get_videostream_metadata(reference_video_path)
         num_frames = snap_frames_to_grid(meta.frames)
         frame_rate = float(meta.fps)
+
+        if chunk_config is None:
+            chunk_config = ChunkConfig(chunk_pixel_frames=num_frames, next_video_carry_frames=0)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -238,7 +243,13 @@ class DubItPipeline:
             tiling_config,
             scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
-            video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
+            video_shape=VideoPixelShape(
+                batch=1,
+                frames=min(num_frames, chunk_config.chunk_pixel_frames),
+                height=height,
+                width=width,
+                fps=frame_rate,
+            ),
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
             keyframes=decode_with_keyframes,
@@ -260,6 +271,7 @@ class DubItPipeline:
             ref_audio_latent=ref_audio_latent,
             reference_video_path=reference_video_path,
             reference_strength=reference_strength,
+            chunk_config=chunk_config,
         )
 
     def _video_conditionings(
@@ -382,9 +394,8 @@ class DubItPipeline:
             tiling_config=tiling_config,
             generated_keyframes=generated_keyframes,
             decode_with_keyframes=decode_with_keyframes,
+            chunk_config=chunk_config,
         )
-        if chunk_config is None:
-            chunk_config = ChunkConfig(chunk_pixel_frames=ctx.num_frames, next_video_carry_frames=0)
 
         stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
@@ -412,7 +423,7 @@ class DubItPipeline:
             context=VideoAudio(video=ctx.video_context, audio=ctx.audio_context),
             device=self.device,
             dtype=ctx.dtype,
-            config=chunk_config,
+            config=ctx.chunk_config,
             video_scale_factors=self.stage.video_scale_factors,
             make_video_conditionings=make_video,
             make_audio_conditionings=self._audio_conditionings(latent=ctx.ref_audio_latent, fps=ctx.frame_rate),
